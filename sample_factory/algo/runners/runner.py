@@ -47,6 +47,8 @@ from sample_factory.utils.utils import (
 )
 from sample_factory.utils.wandb_utils import init_wandb
 
+SHUTDOWN_DRAIN_TIMEOUT_SEC = 10.0
+
 
 class AlgoObserver:
     def on_init(self, runner: Runner) -> None:
@@ -763,6 +765,20 @@ class Runner(EventLoopObject, Configurable):
         assert self.event_loop.owner is self
         self.event_loop.stop()
 
+    def _force_shutdown_processes(self):
+        pass
+
+    def _drain_shutdown(self):
+        deadline = time.time() + SHUTDOWN_DRAIN_TIMEOUT_SEC
+        while self.components_to_stop and time.time() < deadline:
+            self.event_loop.process_events()
+            time.sleep(0.01)
+
+        if self.components_to_stop:
+            remaining = [component.object_id for component in self.components_to_stop]
+            log.error("Forcing shutdown with components still running: %r", remaining)
+            self._force_shutdown_processes()
+
     # noinspection PyBroadException
     def run(self) -> StatusCode:
         with self.timing.timeit("main_loop"):
@@ -771,10 +787,15 @@ class Runner(EventLoopObject, Configurable):
                 self.status = (
                     ExperimentStatus.INTERRUPTED if evt_loop_status == EventLoopStatus.INTERRUPTED else self.status
                 )
-                self.stop.emit(self.object_id)
             except Exception:
                 log.exception(f"Uncaught exception in {self.object_id} evt loop")
                 self.status = ExperimentStatus.FAILURE
+
+            if self.status == ExperimentStatus.FAILURE:
+                self._stop_training(failed=True)
+            elif self.status == ExperimentStatus.INTERRUPTED:
+                self._stop_training()
+            self._drain_shutdown()
 
         log.info(self.timing)
         if self.total_env_steps_since_resume is None:

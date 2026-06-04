@@ -9,7 +9,7 @@ from sample_factory.algo.utils.context import sf_global_context
 from sample_factory.algo.utils.misc import ExperimentStatus
 from sample_factory.algo.utils.multiprocessing_utils import get_mp_ctx
 from sample_factory.utils.typing import StatusCode
-from sample_factory.utils.utils import log
+from sample_factory.utils.utils import join_or_kill, log
 
 
 class ParallelRunner(Runner):
@@ -59,7 +59,12 @@ class ParallelRunner(Runner):
     def _on_everything_stopped(self):
         for p in self.processes:
             log.debug(f"Waiting for process {p.name} to stop...")
-            p.join()
+            join_or_kill(p)
 
         self.sampler.join()
         super()._on_everything_stopped()
+
+    def _force_shutdown_processes(self):
+        for p in self.processes:
+            join_or_kill(p)
+        self.sampler.join()

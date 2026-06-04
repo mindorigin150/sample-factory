@@ -15,7 +15,7 @@ from filelock import FileLock
 
 from sample_factory.algo.utils.rl_utils import make_dones
 from sample_factory.envs.env_utils import RewardShapingInterface, get_default_reward_shaping
-from sample_factory.utils.utils import log
+from sample_factory.utils.utils import join_or_kill, log
 from sf_examples.vizdoom.doom.doom_gym import doom_lock_file
 from sf_examples.vizdoom.doom.doom_render import concat_grid, cvt_doom_obs
 from sf_examples.vizdoom.doom.multiplayer.doom_multiagent import DEFAULT_UDP_PORT, find_available_port
@@ -95,6 +95,7 @@ class MultiAgentEnvWorker:
         self.make_env_func = make_env_func
         self.env_config = env_config
         self.reset_on_init = reset_on_init
+        self.use_multiprocessing = use_multiprocessing
         if use_multiprocessing:
             self.process = Process(target=self.start, daemon=False)
             self.task_queue, self.result_queue = faster_fifo.Queue(), faster_fifo.Queue()
@@ -372,7 +373,12 @@ class MultiAgentEnv(gym.Env, RewardShapingInterface):
                 worker.task_queue.put((None, TaskType.TERMINATE))
                 time.sleep(0.1)
             for worker in self.workers:
-                worker.process.join()
+                if worker.use_multiprocessing:
+                    join_or_kill(worker.process)
+                else:
+                    worker.process.join(timeout=1.0)
+                    if worker.process.is_alive():
+                        log.warning("MultiAgentEnv thread worker %d did not stop", worker.player_id)
 
     def set_env_attr(self, agent_idx, attr_chain, value):
         data = (agent_idx, attr_chain, value)

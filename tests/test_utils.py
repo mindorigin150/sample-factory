@@ -3,7 +3,28 @@ import time
 from sample_factory.utils.dicts import list_of_dicts_to_dict_of_lists
 from sample_factory.utils.network import is_udp_port_available
 from sample_factory.utils.timing import Timing
-from sample_factory.utils.utils import cores_for_worker_process, log
+from sample_factory.utils.utils import cores_for_worker_process, join_or_kill, log
+
+
+class FakeProcess:
+    def __init__(self, alive_after_terminate=False):
+        self.alive = True
+        self.alive_after_terminate = alive_after_terminate
+        self.calls = []
+
+    def join(self, timeout=None):
+        self.calls.append(("join", timeout))
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.calls.append(("terminate", None))
+        self.alive = self.alive_after_terminate
+
+    def kill(self):
+        self.calls.append(("kill", None))
+        self.alive = False
 
 
 class TestUtils:
@@ -58,3 +79,23 @@ class TestUtils:
         lt = [{"a": 1, "b": {"c": 2, "d": 3}}, {"a": 4, "b": {"c": 5, "d": 6}}]
         d = list_of_dicts_to_dict_of_lists(lt)
         assert d == {"a": [1, 4], "b": {"c": [2, 5], "d": [3, 6]}}
+
+    def test_join_or_kill_terminates_process_before_kill(self):
+        process = FakeProcess(alive_after_terminate=False)
+
+        join_or_kill(process, timeout=0.1)
+
+        assert process.calls == [("join", 0.1), ("terminate", None), ("join", 0.1)]
+
+    def test_join_or_kill_kills_process_that_survives_terminate(self):
+        process = FakeProcess(alive_after_terminate=True)
+
+        join_or_kill(process, timeout=0.1)
+
+        assert process.calls == [
+            ("join", 0.1),
+            ("terminate", None),
+            ("join", 0.1),
+            ("kill", None),
+            ("join", 0.1),
+        ]

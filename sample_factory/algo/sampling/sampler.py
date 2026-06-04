@@ -15,7 +15,7 @@ from sample_factory.algo.utils.multiprocessing_utils import get_mp_ctx
 from sample_factory.algo.utils.shared_buffers import BufferMgr
 from sample_factory.cfg.configurable import Configurable
 from sample_factory.utils.typing import Config, MpQueue, PolicyID
-from sample_factory.utils.utils import log
+from sample_factory.utils.utils import join_or_kill, log
 
 
 class AbstractSampler(EventLoopObject, Configurable):
@@ -297,4 +297,4 @@ class ParallelSampler(Sampler):
     def join(self) -> None:
         for p in self.processes:
             log.debug(f"Waiting for process {p.name} to join...")
-            p.join()
+            join_or_kill(p)
