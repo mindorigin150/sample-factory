@@ -23,6 +23,7 @@ from sample_factory.algo.utils.misc import (
     advance_rollouts_signal,
     memory_stats,
 )
+from sample_factory.algo.utils.cuda_event_handoff import record_cuda_event, wait_cuda_event
 from sample_factory.algo.utils.model_sharing import ParameterServer, make_parameter_client
 from sample_factory.algo.utils.rl_utils import prepare_and_normalize_obs
 from sample_factory.algo.utils.shared_buffers import policy_device
@@ -109,6 +110,8 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         self.requests = []
         self.total_num_samples = self.last_report_samples = 0
+        self._policy_output_events: Dict[Tuple[int, int], torch.cuda.Event] = dict()
+        self._policy_request_wait_events: List[torch.cuda.Event] = []
 
         self._get_inference_requests_func = (
             self._get_inference_requests_serial if cfg.serial_mode else self._get_inference_requests_async
@@ -186,8 +189,11 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
         with timing.add_time("deserialize"):
             obs = dict()
             rnn_states = []
-            for actor_idx, split_idx, traj_idx, device in self.requests:
+            self._policy_request_wait_events.clear()
+            for actor_idx, split_idx, traj_idx, device, event_handle in self.requests:
                 # TODO: what should we do with data sampled on different devices
+                if event_handle is not None:
+                    self._policy_request_wait_events.append(wait_cuda_event(device, event_handle))
                 traj_tensors = self.traj_tensors[device]
                 dict_of_lists_append_idx(obs, traj_tensors["obs"], traj_idx)
                 rnn_states.append(traj_tensors["rnn_states"][traj_idx])
@@ -208,10 +214,13 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
     def _batch_individual_steps(self, timing):
         with timing.add_time("deserialize"):
+            self._policy_request_wait_events.clear()
             indices = []
             for request in self.requests:
                 # TODO: what should we do with data sampled on different devices
-                actor_idx, split_idx, request_data, device = request
+                actor_idx, split_idx, request_data, device, event_handle = request
+                if event_handle is not None:
+                    self._policy_request_wait_events.append(wait_cuda_event(device, event_handle))
                 for env_idx, agent_idx, traj_buffer_idx, rollout_step in request_data:
                     index = [traj_buffer_idx, rollout_step]
                     indices.append(index)
@@ -249,24 +258,25 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
         # assuming all workers provide the same number of samples
         samples_per_actor = num_samples // len(requests)
         ofs = 0
-        devices_to_sync = set()
-        for actor_idx, split_idx, _, device in requests:
+        event_handles = dict()
+        for actor_idx, split_idx, _, device, _ in requests:
             self.policy_output_tensors[device][actor_idx, split_idx] = policy_outputs[ofs : ofs + samples_per_actor]
             ofs += samples_per_actor
-            devices_to_sync.add(device)
+
+        for actor_idx, split_idx, _, device, _ in requests:
+            if torch.device(device).type == "cuda" and not self.cfg.serial_mode:
+                key = (actor_idx, split_idx)
+                event, handle = record_cuda_event(device, self._policy_output_events.get(key))
+                self._policy_output_events[key] = event
+                event_handles[key] = handle
 
         signals_to_send: AdvanceRolloutSignals = dict()
-        for actor_idx, split_idx, _, _ in requests:
-            payload = (split_idx, self.policy_id)
+        for actor_idx, split_idx, _, _, _ in requests:
+            payload = (split_idx, self.policy_id, event_handles.get((actor_idx, split_idx)))
             if actor_idx in signals_to_send:
                 signals_to_send[actor_idx].append(payload)
             else:
                 signals_to_send[actor_idx] = [payload]
-
-        # to make sure we committed all writes to shared device memory, we need to sync all devices
-        # typically this will be a single CUDA device
-        for device in devices_to_sync:
-            synchronize(self.cfg, device)
 
         return signals_to_send
 
@@ -294,7 +304,7 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
         signals_to_send: AdvanceRolloutSignals = dict()
         output_indices = []
         for request in requests:
-            actor_idx, split_idx, request_data, _ = request
+            actor_idx, split_idx, request_data, _, _ = request
             for env_idx, agent_idx, traj_buffer_idx, rollout_step in request_data:
                 output_indices.append([actor_idx, split_idx, env_idx, agent_idx])
 

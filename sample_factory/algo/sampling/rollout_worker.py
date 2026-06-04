@@ -189,18 +189,23 @@ class RolloutWorker(HeartbeatStoppableEventLoopObject, Configurable):
         with self.timing.add_time("enqueue_policy_requests"):
             policy_request = runner.generate_policy_request()
 
-            # make sure all writes to shared device buffers are completed
-            runner.synchronize_devices()
+            event_handle = None
+            if policy_request is not None:
+                if runner.cuda_event_handoff_enabled():
+                    event_handle = runner.record_policy_request_event()
+                else:
+                    # make sure all writes to shared device buffers are completed
+                    runner.synchronize_devices()
 
         with self.timing.add_time("enqueue_policy_requests"):
             if policy_request is not None:
-                self._enqueue_policy_request(runner.split_idx, policy_request)
+                self._enqueue_policy_request(runner.split_idx, policy_request, event_handle)
 
-    def _enqueue_policy_request(self, split_idx, policy_inputs):
+    def _enqueue_policy_request(self, split_idx, policy_inputs, event_handle):
         """Distribute action requests to their corresponding queues."""
 
         for policy_id, requests in policy_inputs.items():
-            policy_request = (self.worker_idx, split_idx, requests, self.sampling_device)
+            policy_request = (self.worker_idx, split_idx, requests, self.sampling_device, event_handle)
             self.inference_queues[policy_id].put(policy_request)
 
         if not policy_inputs:
@@ -227,7 +232,7 @@ class RolloutWorker(HeartbeatStoppableEventLoopObject, Configurable):
         for policy_id, rollouts in rollouts_per_policy.items():
             self.emit(new_trajectories_signal(policy_id), rollouts, self.sampling_device)
 
-    def advance_rollouts(self, split_idx: int, policy_id: PolicyID) -> None:
+    def advance_rollouts(self, split_idx: int, policy_id: PolicyID, event_handle=None) -> None:
         # TODO: update comment
         """
         Process incoming request from policy worker. Use the data (policy outputs, actions) to advance the simulation
@@ -238,6 +243,9 @@ class RolloutWorker(HeartbeatStoppableEventLoopObject, Configurable):
         """
         with inference_context(self.cfg.serial_mode):
             runner = self.env_runners[split_idx]
+            if event_handle is not None:
+                with self.timing.add_time("wait_policy_outputs_event"):
+                    runner.wait_policy_outputs_event(event_handle)
             complete_rollouts, episodic_stats = runner.advance_rollouts(policy_id, self.timing)
 
             with self.timing.add_time("complete_rollouts"):

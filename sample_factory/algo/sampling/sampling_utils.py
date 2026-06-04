@@ -43,6 +43,15 @@ class VectorEnvRunner(Configurable):
     def synchronize_devices(self) -> None:
         raise NotImplementedError()
 
+    def cuda_event_handoff_enabled(self) -> bool:
+        return False
+
+    def record_policy_request_event(self):
+        return None
+
+    def wait_policy_outputs_event(self, _handle) -> None:
+        return None
+
     def close(self):
         raise NotImplementedError()
 
