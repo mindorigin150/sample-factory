@@ -53,7 +53,7 @@ setup(
         # "faster-fifo>=1.4.2,<2.0",  <-- installed by signal-slot-mp
         "signal-slot-mp>=1.0.3,<2.0",
         "filelock",
-        "opencv-python",
+        "opencv-python-headless",
         "wandb>=0.12.9",
         "huggingface-hub>=0.10.0,<1.0",
     ],
