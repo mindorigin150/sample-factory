@@ -97,16 +97,14 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         self.request_count = deque(maxlen=50)
 
-        # very conservative limit on the minimum number of requests to wait for
-        # this will almost guarantee that the system will continue collecting experience
-        # at max rate even when 2/3 of workers are stuck for some reason (e.g. doing a long env reset)
-        # Although if your workflow involves very lengthy operations that often freeze workers, it can be beneficial
-        # to set min_num_requests to 1 (at a cost of potential inefficiency, i.e. policy worker will use very small
-        # batches)
-        min_num_requests = self.cfg.num_workers // (self.cfg.num_policies * self.cfg.policy_workers_per_policy)
-        min_num_requests //= 3
-        self.min_num_requests = max(1, min_num_requests)
-        log.info(f"{self.object_id}: min num requests: %d", self.min_num_requests)
+        if self.device.type != "cpu":
+            # very conservative limit on the minimum number of requests to wait for
+            # this will almost guarantee that the system will continue collecting experience
+            # at max rate even when 2/3 of workers are stuck for some reason (e.g. doing a long env reset)
+            min_num_requests = self.cfg.num_workers // (self.cfg.num_policies * self.cfg.policy_workers_per_policy)
+            min_num_requests //= 3
+            self.min_num_requests = max(1, min_num_requests)
+            log.info(f"{self.object_id}: min accelerator requests: %d", self.min_num_requests)
 
         self.requests = []
         self.total_num_samples = self.last_report_samples = 0
@@ -356,6 +354,16 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
             pass
 
     def _get_inference_requests_async(self):
+        # A blocking get_many already drains every ready request. On CPU, waiting
+        # again for a target batch only stalls actors between inexpensive forwards.
+        if self.device.type == "cpu":
+            try:
+                with self.timing.timeit("wait_policy"), self.timing.add_time("wait_policy_total"):
+                    self.requests.extend(self.inference_queue.get_many(timeout=0.005))
+            except Empty:
+                pass
+            return
+
         # Very conservative timer. Only wait a little bit, then continue with what we've got.
         wait_for_min_requests = 0.025
 
