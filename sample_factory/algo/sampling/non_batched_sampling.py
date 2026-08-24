@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import gymnasium as gym
 import numpy as np
 
-from sample_factory.algo.sampling.sampling_utils import VectorEnvRunner, record_episode_statistics_wrapper_stats
+from sample_factory.algo.sampling.sampling_utils import (
+    VectorEnvRunner,
+    _clip_actions_to_space,
+    record_episode_statistics_wrapper_stats,
+)
 from sample_factory.algo.utils.agent_policy_mapping import AgentPolicyMapping
 from sample_factory.algo.utils.env_info import EnvInfo, check_env_info
 from sample_factory.algo.utils.make_env import make_env_func_non_batched
@@ -141,6 +145,7 @@ class ActorState:
         :return: the latest set of actions for this actor, calculated by the policy worker for the last observation
         """
         actions = ensure_numpy_array(self.last_actions)
+        actions = _clip_actions_to_space(self.env_info.action_space, actions)
 
         if self.env_info.all_discrete or isinstance(self.env_info.action_space, gym.spaces.Discrete):
             return self._process_action_space(actions, is_discrete=True)

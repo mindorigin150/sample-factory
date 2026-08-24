@@ -9,7 +9,11 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from sample_factory.algo.sampling.sampling_utils import VectorEnvRunner, record_episode_statistics_wrapper_stats
+from sample_factory.algo.sampling.sampling_utils import (
+    VectorEnvRunner,
+    _clip_actions_to_space,
+    record_episode_statistics_wrapper_stats,
+)
 from sample_factory.algo.utils.env_info import EnvInfo, check_env_info
 from sample_factory.algo.utils.make_env import BatchedVecEnv, SequentialVectorizeWrapper, make_env_func_batched
 from sample_factory.algo.utils.misc import EPISODIC, POLICY_ID_KEY
@@ -37,6 +41,8 @@ def preprocess_actions(env_info: EnvInfo, actions: Tensor | np.ndarray) -> Tenso
     A potential way to reduce this complexity: demand all environments to have a Tuple action space even if they
     only have a single Discrete or Box action space.
     """
+
+    actions = _clip_actions_to_space(env_info.action_space, actions)
 
     if env_info.all_discrete or isinstance(env_info.action_space, gym.spaces.Discrete):
         return process_action_space(actions, env_info.gpu_actions, is_discrete=True)

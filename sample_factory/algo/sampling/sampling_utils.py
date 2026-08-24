@@ -2,14 +2,45 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+import gymnasium as gym
+import numpy as np
 import torch
 
+from sample_factory.algo.utils.action_distributions import calc_num_actions
 from sample_factory.algo.utils.env_info import EnvInfo
 from sample_factory.cfg.configurable import Configurable
 from sample_factory.utils.attr_dict import AttrDict
 from sample_factory.utils.gpu_utils import gpus_for_process
 from sample_factory.utils.timing import Timing
 from sample_factory.utils.typing import PolicyID
+
+
+def _clip_actions_to_space(action_space: gym.Space, actions):
+    """Clip continuous actions at the environment boundary without changing rollout data."""
+    if isinstance(action_space, gym.spaces.Box):
+        if isinstance(actions, torch.Tensor):
+            low = torch.as_tensor(action_space.low, dtype=actions.dtype, device=actions.device)
+            high = torch.as_tensor(action_space.high, dtype=actions.dtype, device=actions.device)
+            return torch.clamp(actions, min=low, max=high)
+        return np.clip(actions, action_space.low, action_space.high)
+
+    if isinstance(action_space, gym.spaces.Tuple):
+        if not any(isinstance(space, gym.spaces.Box) for space in action_space):
+            return actions
+
+        action_splits = [calc_num_actions(space) for space in action_space]
+        if isinstance(actions, torch.Tensor):
+            splits = torch.split(actions, action_splits, dim=-1)
+            return torch.cat(
+                [_clip_actions_to_space(space, split) for space, split in zip(action_space, splits)], dim=-1
+            )
+
+        splits = np.split(actions, np.cumsum(action_splits)[:-1], axis=-1)
+        return np.concatenate(
+            [_clip_actions_to_space(space, split) for space, split in zip(action_space, splits)], axis=-1
+        )
+
+    return actions
 
 
 class VectorEnvRunner(Configurable):
