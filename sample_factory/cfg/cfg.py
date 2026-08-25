@@ -156,6 +156,12 @@ def add_rl_args(p: ArgumentParser):
         "(see function finalize_trajectory in actor_worker.py)",
     )
     p.add_argument(
+        "--wimle_rollout_horizon",
+        default=None,
+        type=int,
+        help="Synthetic rollout horizon required by WIMLE",
+    )
+    p.add_argument(
         "--recurrence",
         default=-1,
         type=int,

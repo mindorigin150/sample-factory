@@ -76,7 +76,7 @@ def policy_output_shapes(num_actions, num_action_distribution_parameters) -> Lis
     return policy_outputs
 
 
-def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, device, share) -> TensorDict:
+def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, device, share, algo: str) -> TensorDict:
     obs_space = env_info.obs_space
 
     tensors = TensorDict()
@@ -89,6 +89,10 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
     # we need to allocate an extra rollout step here to calculate the value estimates for the last step
     for space_name, space in obs_space.spaces.items():
         tensors["obs"][space_name] = init_tensor([num_traj, rollout + 1], space.dtype, space.shape, device, share)
+    if algo == "WIMLE":
+        tensors["next_obs"] = TensorDict()
+        for space_name, space in obs_space.spaces.items():
+            tensors["next_obs"][space_name] = init_tensor([num_traj, rollout], space.dtype, space.shape, device, share)
     tensors["rnn_states"] = init_tensor([num_traj, rollout + 1], torch.float32, [rnn_size], device, share)
 
     num_actions, num_action_distribution_parameters = action_info(env_info)
@@ -219,6 +223,7 @@ class BufferMgr(Configurable):
                 rnn_size,
                 device,
                 share,
+                cfg.algo,
             )
             self.policy_output_tensors_torch[device], output_names, output_sizes = alloc_policy_output_tensors(
                 cfg, env_info, rnn_size, device, share
