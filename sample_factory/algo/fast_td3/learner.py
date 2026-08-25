@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Dict
 
 import torch
@@ -51,8 +52,8 @@ class FastTD3Learner(Learner):
         self.actor_optimizer = None
         self.critic_optimizer = None
         self.update_credit = 0
-        self._actor_for_update = None
-        self._critic_for_update = None
+        self._actor_step_for_update = None
+        self._critic_step_for_update = None
 
     def init(self):
         if self.cfg.seed is not None:
@@ -107,17 +108,17 @@ class FastTD3Learner(Learner):
         self.update_credit = 0
 
         if self.cfg.fasttd3_compile:
-            self._actor_for_update = torch.compile(self.actor_critic.actor, mode="reduce-overhead")
-            self._critic_for_update = torch.compile(self.critic, mode="reduce-overhead")
+            self._actor_step_for_update = torch.compile(self._actor_step, mode="reduce-overhead")
+            self._critic_step_for_update = torch.compile(self._critic_step, mode="reduce-overhead")
         else:
-            self._actor_for_update = self.actor_critic.actor
-            self._critic_for_update = self.critic
+            self._actor_step_for_update = self._actor_step
+            self._critic_step_for_update = self._critic_step
 
         self.is_initialized = True
-        self.param_server.init(self.actor_critic, self.train_step, self.device)
-        self.policy_versions_tensor[self.policy_id] = self.train_step
+        policy_revision = self.env_steps
+        self.param_server.init(self.actor_critic, policy_revision, self.device)
         return model_initialization_data(
-            self.cfg, self.policy_id, self.actor_critic, self.train_step, self.device
+            self.cfg, self.policy_id, self.actor_critic, policy_revision, self.device
         )
 
     def _load_state(self, checkpoint_dict, load_progress=True):
@@ -136,24 +137,14 @@ class FastTD3Learner(Learner):
     def _flatten_obs(obs: Tensor) -> Tensor:
         return obs.reshape(obs.shape[0], -1)
 
-    def _update(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        obs = self._flatten_obs(batch["obs"])
-        next_obs = self._flatten_obs(batch["next_obs"])
-        with self.param_server.policy_lock:
-            obs = self.actor_critic.empirical_obs_normalizer(obs)
-            next_obs = self.actor_critic.empirical_obs_normalizer(next_obs)
-        actions = batch["actions"]
-        rewards = batch["rewards"]
-        bootstrap = (batch["timeouts"] | ~batch["dones"]).float()
-        discount = torch.full_like(rewards, self.cfg.gamma)
-
+    def _critic_step(self, obs, next_obs, actions, rewards, bootstrap, discount):
         with torch.autocast(
             device_type=self.device.type,
             dtype=torch.bfloat16,
             enabled=self.device.type == "cuda",
         ):
             with torch.no_grad():
-                target_actions = self._actor_for_update(next_obs)
+                target_actions = self.actor_critic.actor(next_obs)
                 target_noise = torch.randn_like(target_actions).mul(TARGET_POLICY_NOISE).clamp(
                     -TARGET_NOISE_CLIP, TARGET_NOISE_CLIP
                 )
@@ -169,7 +160,7 @@ class FastTD3Learner(Learner):
                     target_dist_2,
                 )
 
-            current_dist_1, current_dist_2 = self._critic_for_update(obs, actions)
+            current_dist_1, current_dist_2 = self.critic(obs, actions)
             critic_loss = -(
                 target_dist * F.log_softmax(current_dist_1, dim=1)
             ).sum(dim=1).mean()
@@ -180,28 +171,50 @@ class FastTD3Learner(Learner):
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_optimizer.step()
+        return critic_loss.detach(), target_value_1.mean().detach()
+
+    def _actor_step(self, obs):
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.bfloat16,
+            enabled=self.device.type == "cuda",
+        ):
+            actor_actions = self.actor_critic.actor(obs)
+            actor_dist_1, actor_dist_2 = self.critic(obs, actor_actions)
+            actor_values = torch.minimum(
+                self.critic.get_value(F.softmax(actor_dist_1, dim=1)),
+                self.critic.get_value(F.softmax(actor_dist_2, dim=1)),
+            )
+            actor_loss = -actor_values.mean()
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        return actor_loss.detach()
+
+    def _update(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        obs = self._flatten_obs(batch["obs"])
+        next_obs = self._flatten_obs(batch["next_obs"])
+        with self.param_server.policy_lock:
+            obs = self.actor_critic.empirical_obs_normalizer(obs)
+            next_obs = self.actor_critic.empirical_obs_normalizer(next_obs)
+        actions = batch["actions"]
+        rewards = batch["rewards"]
+        bootstrap = (batch["timeouts"] | ~batch["dones"]).float()
+        discount = torch.full_like(rewards, self.cfg.gamma)
+
+        critic_loss, q_value = self._critic_step_for_update(
+            obs, next_obs, actions, rewards, bootstrap, discount
+        )
+        critic_loss = critic_loss.clone()
+        q_value = q_value.clone()
 
         next_train_step = self.train_step + 1
         actor_loss = torch.zeros((), device=self.device)
         if next_train_step % POLICY_DELAY == 0:
             for parameter in self.critic.parameters():
                 parameter.requires_grad_(False)
-            with torch.autocast(
-                device_type=self.device.type,
-                dtype=torch.bfloat16,
-                enabled=self.device.type == "cuda",
-            ):
-                actor_actions = self._actor_for_update(obs)
-                actor_dist_1, actor_dist_2 = self._critic_for_update(obs, actor_actions)
-                actor_values = torch.minimum(
-                    self.critic.get_value(F.softmax(actor_dist_1, dim=1)),
-                    self.critic.get_value(F.softmax(actor_dist_2, dim=1)),
-                )
-                actor_loss = -actor_values.mean()
-            self.actor_optimizer.zero_grad(set_to_none=True)
-            actor_loss.backward()
             with self.param_server.policy_lock:
-                self.actor_optimizer.step()
+                actor_loss = self._actor_step_for_update(obs).clone()
             for parameter in self.critic.parameters():
                 parameter.requires_grad_(True)
 
@@ -213,12 +226,13 @@ class FastTD3Learner(Learner):
 
         self.train_step = next_train_step
         return {
-            "critic_loss": critic_loss.detach(),
-            "actor_loss": actor_loss.detach(),
-            "q_value": target_value_1.mean().detach(),
+            "critic_loss": critic_loss,
+            "actor_loss": actor_loss,
+            "q_value": q_value,
         }
 
     def train(self, batch: TensorDict):
+        self.actor_critic.train()
         observations = batch["obs"]["obs"][:, :-1].flatten(0, 1).float()
         next_observations = batch["next_obs"]["obs"].flatten(0, 1).float()
         actions = batch["actions"].flatten(0, 1).float()
@@ -248,13 +262,14 @@ class FastTD3Learner(Learner):
 
         with self.timing.add_time("publish_weights"):
             synchronize(self.cfg, self.device)
-            self.param_server.update_weights(self.train_step)
+            self.param_server.update_weights(self.env_steps)
         report = {
             LEARNER_ENV_STEPS: self.env_steps,
             POLICY_ID_KEY: self.policy_id,
             STATS_KEY: {"replay": len(self.replay), "update_credit": self.update_credit},
         }
-        if stats:
+        if stats and self._should_save_summaries():
+            self.last_summary_time = time.time()
             report[TRAIN_STATS] = {name: value.item() for name, value in stats.items()}
         return report
 

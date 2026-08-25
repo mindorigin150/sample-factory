@@ -239,6 +239,6 @@ class BufferMgr(Configurable):
                 for i in range(num_buffers):
                     self.traj_buffer_queues[device].put(i)
 
-        self.policy_versions = torch.zeros([cfg.num_policies], dtype=torch.int32)
+        self.policy_versions = torch.zeros([cfg.num_policies], dtype=torch.int64)
         if share:
             self.policy_versions.share_memory_()

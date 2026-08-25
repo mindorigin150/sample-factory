@@ -133,8 +133,13 @@ def verify_cfg(cfg: Config, env_info: EnvInfo) -> bool:
         # batch.
         cfg_error("Normalized returns are not supported with vtrace!")
 
-    if cfg.algo == "FAST_TD3" and cfg.batched_sampling:
-        cfg_error("FAST_TD3 does not support batched sampling")
+    if cfg.algo == "FAST_TD3":
+        if cfg.batched_sampling:
+            cfg_error("FAST_TD3 does not support batched sampling")
+        if cfg.async_rl:
+            cfg_error("FAST_TD3 does not support async RL")
+        if cfg.use_rnn:
+            cfg_error("FAST_TD3 does not support RNNs")
 
     if cfg.async_rl and cfg.serial_mode:
         log.warning(
