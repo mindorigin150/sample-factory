@@ -155,12 +155,12 @@ def add_rl_args(p: ArgumentParser):
         "rollout, although for PBT training it is currently recommended that rollout << episode_len"
         "(see function finalize_trajectory in actor_worker.py)",
     )
-    p.add_argument(
-        "--wimle_rollout_horizon",
-        default=None,
-        type=int,
-        help="Synthetic rollout horizon required by WIMLE",
-    )
+    p.add_argument("--fasttd3_replay_capacity", default=6_553_600, type=int)
+    p.add_argument("--fasttd3_replay_batch_size", default=32_768, type=int)
+    p.add_argument("--fasttd3_transitions_per_update", default=64, type=int)
+    p.add_argument("--fasttd3_v_min", default=-250.0, type=float)
+    p.add_argument("--fasttd3_v_max", default=250.0, type=float)
+    p.add_argument("--fasttd3_compile", default=True, type=str2bool)
     p.add_argument(
         "--recurrence",
         default=-1,

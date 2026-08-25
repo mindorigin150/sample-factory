@@ -289,10 +289,11 @@ def default_make_actor_critic_func(cfg: Config, obs_space: ObsSpace, action_spac
 
 
 def create_actor_critic(cfg: Config, obs_space: ObsSpace, action_space: ActionSpace) -> ActorCritic:
-    if cfg.algo == "WIMLE":
-        from sample_factory.algo.wimle.models import WIMLEActorCritic
+    if cfg.algo == "FAST_TD3":
+        # Local import breaks the model factory cycle: FastTD3ActorCritic extends ActorCritic.
+        from sample_factory.algo.fast_td3.models import FastTD3ActorCritic
 
-        return WIMLEActorCritic(None, obs_space, action_space, cfg)
+        return FastTD3ActorCritic(obs_space, action_space, cfg)
 
     # check if user specified custom actor/critic creation function
     from sample_factory.algo.utils.context import global_model_factory

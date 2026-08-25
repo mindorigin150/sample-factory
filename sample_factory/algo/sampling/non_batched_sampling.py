@@ -535,7 +535,7 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
         for agent_i in range(self.num_agents):
             actor_state = env_actor_states[agent_i]
 
-            if self.cfg.algo == "WIMLE":
+            if self.cfg.algo == "FAST_TD3":
                 done = terminated[agent_i] or truncated[agent_i]
                 next_obs = infos[agent_i]["final_observation"] if done else new_obs[agent_i]
                 actor_state.curr_traj_buffer["next_obs"][self.rollout_step] = next_obs

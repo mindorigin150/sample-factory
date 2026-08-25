@@ -1,7 +1,13 @@
-WIMLE integration includes a PyTorch translation of algorithms from:
-https://github.com/mehranagh20/wimle/tree/be730d6e7cd1538ca5519b8f505feff126b92938
+FastTD3 integration includes code adapted from:
 
-Copyright (c) 2024 Mehran Aghabozorgi
+FastTD3, https://github.com/younggyoseo/FastTD3, commit
+229ed59bbf43ea2f7a2d5d90d1076314839944d7 (MIT License, Copyright 2025
+Younggyo Seo), and C51/TD3 components derived from the MIT-licensed
+CleanRL and Scott Fujimoto TD3 implementations.
+
+MIT License
+
+Copyright (c) 2025 Younggyo Seo
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

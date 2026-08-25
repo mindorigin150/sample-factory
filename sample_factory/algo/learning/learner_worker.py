@@ -10,8 +10,8 @@ from signal_slot.signal_slot import EventLoop, Timer, signal
 from torch import Tensor
 
 from sample_factory.algo.learning.batcher import Batcher
+from sample_factory.algo.fast_td3.learner import FastTD3Learner
 from sample_factory.algo.learning.learner import Learner
-from sample_factory.algo.wimle.learner import WIMLELearner
 from sample_factory.algo.utils.context import SampleFactoryContext, set_global_context
 from sample_factory.algo.utils.env_info import EnvInfo
 from sample_factory.algo.utils.heartbeat import HeartbeatStoppableEventLoopObject
@@ -68,7 +68,7 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         policy_versions_tensor: Tensor = buffer_mgr.policy_versions
         self.param_server = ParameterServer(policy_id, policy_versions_tensor, cfg.serial_mode)
-        learner_cls = WIMLELearner if cfg.algo == "WIMLE" else Learner
+        learner_cls = FastTD3Learner if cfg.algo == "FAST_TD3" else Learner
         self.learner = learner_cls(cfg, env_info, policy_versions_tensor, policy_id, self.param_server)
 
         # total number of full training iterations (potentially multiple minibatches/epochs per iteration)

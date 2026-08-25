@@ -89,7 +89,7 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
     # we need to allocate an extra rollout step here to calculate the value estimates for the last step
     for space_name, space in obs_space.spaces.items():
         tensors["obs"][space_name] = init_tensor([num_traj, rollout + 1], space.dtype, space.shape, device, share)
-    if algo == "WIMLE":
+    if algo == "FAST_TD3":
         tensors["next_obs"] = TensorDict()
         for space_name, space in obs_space.spaces.items():
             tensors["next_obs"][space_name] = init_tensor([num_traj, rollout], space.dtype, space.shape, device, share)
