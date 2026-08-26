@@ -87,12 +87,6 @@ def test_sonic_decoder_uses_only_token_prefix():
     assert decoder.session.binding.input_shape == (2, 64 + 930)
 
 
-def test_fasttd3_sonic_residual_scale_defaults_to_none():
-    cfg = default_cfg("FAST_TD3", "fasttd3_sonic_residual")
-
-    assert cfg.fasttd3_sonic_residual_scale is None
-
-
 def test_c51_projection_preserves_probability_mass():
     critic = Critic(3, 2)
     projected = critic.projection(

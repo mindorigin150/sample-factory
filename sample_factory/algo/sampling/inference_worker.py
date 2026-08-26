@@ -348,10 +348,8 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                     # Keep the full policy action in the trajectory; only body actions
                     # decoded from the token prefix are sent through env_actions.
                     decoder_tokens = policy_outputs["actions"]
-                    if self.cfg.fasttd3_sonic_residual_scale is not None:
-                        decoder_tokens = normalized_obs["base_token"] + (
-                            self.cfg.fasttd3_sonic_residual_scale * decoder_tokens
-                        )
+                    if "base_token" in normalized_obs:
+                        decoder_tokens = normalized_obs["base_token"] + decoder_tokens
                     policy_outputs["env_actions"] = self.sonic_decoder(
                         decoder_tokens,
                         normalized_obs["sonic_state"],

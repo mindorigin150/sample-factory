@@ -35,7 +35,7 @@ def test_cpu_inference_does_not_block_after_available_batch():
     assert queue.blocking_reads == 1
 
 
-def test_inference_worker_composes_residual_before_sonic_decoder(monkeypatch):
+def test_inference_worker_adds_sonic_reference_before_decoder(monkeypatch):
     class ActorCritic:
         training = False
 
@@ -67,7 +67,7 @@ def test_inference_worker_composes_residual_before_sonic_decoder(monkeypatch):
 
     worker = InferenceWorker.__new__(InferenceWorker)
     worker.event_loop = None
-    worker.cfg = type("Config", (), {"serial_mode": True, "fasttd3_sonic_residual_scale": 0.0625})()
+    worker.cfg = type("Config", (), {"serial_mode": True})()
     worker.device = torch.device("cpu")
     worker._batch_func = lambda timing: (obs, torch.zeros(2, 1))
     worker.param_client = type("ParamClient", (), {"actor_critic": ActorCritic(), "policy_version": 3})()
@@ -84,8 +84,7 @@ def test_inference_worker_composes_residual_before_sonic_decoder(monkeypatch):
     )
     worker._handle_policy_steps(worker.timing)
 
-    torch.testing.assert_close(decoder.tokens, base_token + 0.0625 * residual)
-    assert decoder.tokens[0, 0] > 1.0
+    torch.testing.assert_close(decoder.tokens, base_token + residual)
     torch.testing.assert_close(decoder.state, sonic_state)
     torch.testing.assert_close(captured["actions"], residual)
     assert captured["env_actions"].shape == (2, 29)
