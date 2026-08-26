@@ -33,3 +33,59 @@ def test_cpu_inference_does_not_block_after_available_batch():
 
     assert worker.requests == ["request"]
     assert queue.blocking_reads == 1
+
+
+def test_inference_worker_composes_residual_before_sonic_decoder(monkeypatch):
+    class ActorCritic:
+        training = False
+
+        def eval(self):
+            return self
+
+        def __call__(self, normalized_obs, rnn_states):
+            return {
+                "actions": residual.clone(),
+                "values": torch.zeros(rnn_states.shape[0]),
+            }
+
+    class Decoder:
+        def __call__(self, tokens, state):
+            self.tokens = tokens
+            self.state = state
+            return torch.zeros(tokens.shape[0], 29)
+
+    base_token = torch.full((2, 64), 0.98)
+    residual = torch.ones(2, 64)
+    sonic_state = torch.zeros(2, 930)
+    obs = {
+        "obs": torch.zeros(2, 3),
+        "base_token": base_token,
+        "sonic_state": sonic_state,
+    }
+    decoder = Decoder()
+    captured = {}
+
+    worker = InferenceWorker.__new__(InferenceWorker)
+    worker.event_loop = None
+    worker.cfg = type("Config", (), {"serial_mode": True, "fasttd3_sonic_residual_scale": 0.0625})()
+    worker.device = torch.device("cpu")
+    worker._batch_func = lambda timing: (obs, torch.zeros(2, 1))
+    worker.param_client = type("ParamClient", (), {"actor_critic": ActorCritic(), "policy_version": 3})()
+    worker.sonic_decoder = decoder
+    worker.total_num_samples = 0
+    worker.timing = Timing()
+    worker.requests = []
+    worker._prepare_policy_outputs_func = lambda num_samples, outputs, requests: captured.update(outputs) or {}
+    worker.emit_many = lambda *args: None
+
+    monkeypatch.setattr(
+        "sample_factory.algo.sampling.inference_worker.prepare_and_normalize_obs",
+        lambda actor_critic, observations: observations,
+    )
+    worker._handle_policy_steps(worker.timing)
+
+    torch.testing.assert_close(decoder.tokens, base_token + 0.0625 * residual)
+    assert decoder.tokens[0, 0] > 1.0
+    torch.testing.assert_close(decoder.state, sonic_state)
+    torch.testing.assert_close(captured["actions"], residual)
+    assert captured["env_actions"].shape == (2, 29)

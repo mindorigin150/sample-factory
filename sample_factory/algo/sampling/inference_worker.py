@@ -347,8 +347,13 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                 if self.sonic_decoder is not None:
                     # Keep the full policy action in the trajectory; only body actions
                     # decoded from the token prefix are sent through env_actions.
+                    decoder_tokens = policy_outputs["actions"]
+                    if self.cfg.fasttd3_sonic_residual_scale is not None:
+                        decoder_tokens = normalized_obs["base_token"] + (
+                            self.cfg.fasttd3_sonic_residual_scale * decoder_tokens
+                        )
                     policy_outputs["env_actions"] = self.sonic_decoder(
-                        policy_outputs["actions"],
+                        decoder_tokens,
                         normalized_obs["sonic_state"],
                     )
                 policy_outputs["policy_version"] = torch.empty([num_samples]).fill_(self.param_client.policy_version)

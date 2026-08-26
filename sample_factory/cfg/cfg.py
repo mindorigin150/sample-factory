@@ -162,6 +162,7 @@ def add_rl_args(p: ArgumentParser):
     p.add_argument("--fasttd3_v_max", default=250.0, type=float)
     p.add_argument("--fasttd3_compile", default=True, type=str2bool)
     p.add_argument("--fasttd3_sonic_decoder_path", default=None, type=str)
+    p.add_argument("--fasttd3_sonic_residual_scale", default=None, type=float)
     p.add_argument(
         "--recurrence",
         default=-1,
