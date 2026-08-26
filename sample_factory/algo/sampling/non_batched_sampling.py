@@ -75,6 +75,7 @@ class ActorState:
         self.policy_output_tensors = policy_output_tensors
 
         self.last_actions = None
+        self.last_env_actions = None
         self.last_policy_steps = None
 
         self.last_obs = None
@@ -490,6 +491,10 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
                         policy_outputs_dict[name] = policy_outputs[tensor_idx]
 
                     # save parsed trajectory outputs directly into the trajectory buffer
+                    if self.cfg.fasttd3_sonic_decoder_path:
+                        actor_state.last_env_actions = policy_outputs_dict.pop(
+                            "env_actions"
+                        ).squeeze()
                     actor_state.set_trajectory_data(policy_outputs_dict, self.rollout_step)
                     actor_state.last_actions = policy_outputs_dict["actions"].squeeze()
 
@@ -640,6 +645,12 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
 
         for env_i, e in enumerate(self.envs):
             with timing.add_time("env_step"):
+                if self.cfg.fasttd3_sonic_decoder_path:
+                    e.unwrapped.set_decoded_action(
+                        ensure_numpy_array(
+                            self.actor_states[env_i][0].last_env_actions
+                        )
+                    )
                 actions = [s.curr_actions() for s in self.actor_states[env_i]]
                 new_obs, rewards, terminated, truncated, infos = e.step(actions)
 

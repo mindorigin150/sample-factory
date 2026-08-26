@@ -8,8 +8,10 @@ from gymnasium import spaces
 from sample_factory.algo.fast_td3.learner import FastTD3Learner
 from sample_factory.algo.fast_td3.models import Critic, FastTD3ActorCritic
 from sample_factory.algo.fast_td3.replay import FlatReplayBuffer
+from sample_factory.algo.fast_td3.sonic import SonicCudaDecoder
 from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, TRAIN_STATS
 from sample_factory.algo.utils.model_sharing import ParameterClientAsync, ParameterServer
+from sample_factory.algo.utils.shared_buffers import alloc_policy_output_tensors
 from sample_factory.cfg.arguments import default_cfg, verify_cfg
 from sample_factory.utils.timing import Timing
 
@@ -34,6 +36,55 @@ def test_actor_uses_sf_contract_and_carries_noise_scale():
     assert torch.all(result["actions"].abs() <= 1.0)
     assert torch.all((result["new_rnn_states"] >= 0.001) & (result["new_rnn_states"] <= 0.4))
     assert actor.obs_normalizer({"obs": torch.ones(2, 3)})["obs"].equal(torch.ones(2, 3))
+
+
+def test_sonic_policy_keeps_hand_actions_in_policy_outputs():
+    cfg = default_cfg("FAST_TD3", "fasttd3_sonic")
+    cfg.num_workers = 1
+    cfg.num_envs_per_worker = 1
+    cfg.worker_num_splits = 1
+    cfg.batched_sampling = False
+    cfg.fasttd3_sonic_decoder_path = "decoder.onnx"
+    env_info = SimpleNamespace(
+        num_agents=1,
+        action_space=spaces.Box(-1.0, 1.0, (78,), dtype=np.float32),
+    )
+
+    outputs, names, _ = alloc_policy_output_tensors(
+        cfg, env_info, rnn_size=1, device=torch.device("cpu"), share=False
+    )
+
+    assert outputs.shape[-1] == 78 + 156 + 1 + 1 + 1 + 29 + 1
+    assert names[-2:] == ("env_actions", "new_rnn_states")
+
+
+def test_sonic_decoder_uses_only_token_prefix():
+    class Binding:
+        def bind_input(self, name, device, device_id, dtype, shape, data_ptr):
+            self.input_shape = shape
+
+        def bind_output(self, *args):
+            pass
+
+    class Session:
+        def io_binding(self):
+            self.binding = Binding()
+            return self.binding
+
+        def run_with_iobinding(self, binding):
+            self.binding = binding
+
+    decoder = SonicCudaDecoder.__new__(SonicCudaDecoder)
+    decoder.device = torch.device("cpu")
+    decoder.session = Session()
+    decoder.input_name = "input"
+    decoder.output_name = "output"
+    decoder_input = torch.zeros(2, 78)
+    state = torch.zeros(2, 930)
+
+    decoder(decoder_input, state)
+
+    assert decoder.session.binding.input_shape == (2, 64 + 930)
 
 
 def test_c51_projection_preserves_probability_mass():

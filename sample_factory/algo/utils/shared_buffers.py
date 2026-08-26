@@ -133,6 +133,8 @@ def alloc_policy_output_tensors(cfg, env_info: EnvInfo, rnn_size, device, share)
 
     num_actions, num_action_distribution_parameters = action_info(env_info)
     policy_outputs = policy_output_shapes(num_actions, num_action_distribution_parameters)
+    if cfg.fasttd3_sonic_decoder_path:
+        policy_outputs.append(("env_actions", [29]))
     policy_outputs += [("new_rnn_states", [rnn_size])]  # different name so we don't override current step rnn_state
 
     output_names, output_shapes = list(zip(*policy_outputs))
