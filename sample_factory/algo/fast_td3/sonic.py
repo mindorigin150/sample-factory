@@ -9,14 +9,13 @@ SONIC_BODY_ACTION_DIM = 29
 
 
 class SonicCudaDecoder:
-    """Run the frozen SONIC decoder on an inference worker's CUDA stream."""
+    """Run the frozen SONIC decoder with GPU I/O binding."""
 
     def __init__(self, model_path: str, device: torch.device):
         self.device = device
         ort.preload_dlls(directory="")
         provider_options = {
             "device_id": str(device.index),
-            "user_compute_stream": str(torch.cuda.current_stream(device).cuda_stream),
         }
         session_options = ort.SessionOptions()
         session_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
@@ -56,5 +55,7 @@ class SonicCudaDecoder:
             tuple(decoded.shape),
             decoded.data_ptr(),
         )
+        binding.synchronize_inputs()
         self.session.run_with_iobinding(binding)
+        binding.synchronize_outputs()
         return decoded

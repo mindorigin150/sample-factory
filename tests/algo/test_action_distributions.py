@@ -218,3 +218,23 @@ def test_tuple_action_distribution(spaces, sizes):
 
     assert actions.size() == (BATCH_SIZE, num_actions)
     assert action_log_probs.size() == (BATCH_SIZE,)
+
+
+def test_mixed_tuple_argmax_keeps_batch_and_flattened_component_order():
+    action_space = gym.spaces.Tuple(
+        [
+            gym.spaces.Discrete(3),
+            gym.spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32),
+        ]
+    )
+    logits = torch.tensor(
+        [
+            [0.0, 2.0, 1.0, 0.25, -0.5, 0.0, 0.0],
+            [3.0, 1.0, 2.0, -0.25, 0.75, 0.0, 0.0],
+        ]
+    )
+
+    actions = get_action_distribution(action_space, logits).argmax()
+
+    assert actions.shape == (2, 3)
+    torch.testing.assert_close(actions, torch.tensor([[1.0, 0.25, -0.5], [0.0, -0.25, 0.75]]))

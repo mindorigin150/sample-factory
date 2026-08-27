@@ -59,12 +59,20 @@ def test_sonic_policy_keeps_hand_actions_in_policy_outputs():
 
 
 def test_sonic_decoder_uses_only_token_prefix():
+    calls = []
+
     class Binding:
         def bind_input(self, name, device, device_id, dtype, shape, data_ptr):
             self.input_shape = shape
 
         def bind_output(self, *args):
             pass
+
+        def synchronize_inputs(self):
+            calls.append("inputs")
+
+        def synchronize_outputs(self):
+            calls.append("outputs")
 
     class Session:
         def io_binding(self):
@@ -73,6 +81,7 @@ def test_sonic_decoder_uses_only_token_prefix():
 
         def run_with_iobinding(self, binding):
             self.binding = binding
+            calls.append("run")
 
     decoder = SonicCudaDecoder.__new__(SonicCudaDecoder)
     decoder.device = torch.device("cpu")
@@ -85,6 +94,7 @@ def test_sonic_decoder_uses_only_token_prefix():
     decoder(decoder_input, state)
 
     assert decoder.session.binding.input_shape == (2, 64 + 930)
+    assert calls == ["inputs", "run", "outputs"]
 
 
 def test_c51_projection_preserves_probability_mass():
