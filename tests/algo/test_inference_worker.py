@@ -35,7 +35,36 @@ def test_cpu_inference_does_not_block_after_available_batch():
     assert queue.blocking_reads == 1
 
 
-def test_inference_worker_adds_sonic_reference_before_decoder(monkeypatch):
+class TwoBatchQueue:
+    def __init__(self):
+        self.calls = []
+        self.batches = [["first"], ["second"]]
+
+    def get_many(self, block=True, timeout=10.0):
+        self.calls.append((block, timeout))
+        if self.batches:
+            if not block or timeout == 0.005:
+                return self.batches.pop(0)
+        raise Empty
+
+
+def test_gpu_inference_waits_for_minimum_batch():
+    queue = TwoBatchQueue()
+    worker = InferenceWorker.__new__(InferenceWorker)
+    worker.event_loop = None
+    worker.device = torch.device("cuda")
+    worker.inference_queue = queue
+    worker.requests = []
+    worker.timing = Timing()
+    worker.min_num_requests = 2
+
+    worker._get_inference_requests_async()
+
+    assert worker.requests == ["first", "second"]
+    assert queue.calls == [(True, 0.005), (True, 0.005)]
+
+
+def test_inference_worker_decodes_raw_sonic_reference(monkeypatch):
     class ActorCritic:
         training = False
 
@@ -44,7 +73,7 @@ def test_inference_worker_adds_sonic_reference_before_decoder(monkeypatch):
 
         def __call__(self, normalized_obs, rnn_states):
             return {
-                "actions": residual.clone(),
+                "actions": action.clone(),
                 "values": torch.zeros(rnn_states.shape[0]),
             }
 
@@ -54,8 +83,8 @@ def test_inference_worker_adds_sonic_reference_before_decoder(monkeypatch):
             self.state = state
             return torch.zeros(tokens.shape[0], 29)
 
-    base_token = torch.full((2, 64), 0.98)
-    residual = torch.ones(2, 64)
+    base_token = torch.full((2, 64), 0.25)
+    action = torch.ones(2, 6)
     sonic_state = torch.zeros(2, 930)
     obs = {
         "obs": torch.zeros(2, 3),
@@ -78,13 +107,19 @@ def test_inference_worker_adds_sonic_reference_before_decoder(monkeypatch):
     worker._prepare_policy_outputs_func = lambda num_samples, outputs, requests: captured.update(outputs) or {}
     worker.emit_many = lambda *args: None
 
+    def normalize_with_different_decoder_inputs(actor_critic, observations):
+        normalized = dict(observations)
+        normalized["base_token"] = observations["base_token"] + 100.0
+        normalized["sonic_state"] = observations["sonic_state"] + 100.0
+        return normalized
+
     monkeypatch.setattr(
         "sample_factory.algo.sampling.inference_worker.prepare_and_normalize_obs",
-        lambda actor_critic, observations: observations,
+        normalize_with_different_decoder_inputs,
     )
     worker._handle_policy_steps(worker.timing)
 
-    torch.testing.assert_close(decoder.tokens, base_token + residual)
+    torch.testing.assert_close(decoder.tokens, base_token)
     torch.testing.assert_close(decoder.state, sonic_state)
-    torch.testing.assert_close(captured["actions"], residual)
+    torch.testing.assert_close(captured["actions"], action)
     assert captured["env_actions"].shape == (2, 29)

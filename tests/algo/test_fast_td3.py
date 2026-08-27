@@ -38,6 +38,39 @@ def test_actor_uses_sf_contract_and_carries_noise_scale():
     assert actor.obs_normalizer({"obs": torch.ones(2, 3)})["obs"].equal(torch.ones(2, 3))
 
 
+@pytest.mark.parametrize("coefficient", [0.0, 2.5])
+def test_actor_action_l2_is_weighted_and_reported(coefficient):
+    class Actor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.action = torch.nn.Parameter(torch.tensor([0.5, -0.25]))
+
+        def forward(self, obs):
+            return self.action.expand(obs.shape[0], -1)
+
+    class Critic:
+        def __call__(self, obs, actions):
+            logits = torch.cat((actions[:, :1], torch.zeros_like(actions)), dim=1)
+            return logits, logits
+
+        @staticmethod
+        def get_value(probabilities):
+            return probabilities[:, 0]
+
+    learner = FastTD3Learner.__new__(FastTD3Learner)
+    learner.device = torch.device("cpu")
+    learner.cfg = SimpleNamespace(fasttd3_actor_action_l2=coefficient)
+    learner.actor_critic = SimpleNamespace(actor=Actor())
+    learner.critic = Critic()
+    learner.actor_optimizer = torch.optim.SGD(learner.actor_critic.actor.parameters(), lr=0.0)
+    obs = torch.zeros(4, 3)
+
+    actor_loss, actor_q_loss, actor_action_l2 = learner._actor_step(obs)
+
+    torch.testing.assert_close(actor_action_l2, torch.tensor(0.3125))
+    torch.testing.assert_close(actor_loss, actor_q_loss + coefficient * actor_action_l2)
+
+
 def test_sonic_policy_keeps_hand_actions_in_policy_outputs():
     cfg = default_cfg("FAST_TD3", "fasttd3_sonic")
     cfg.num_workers = 1
@@ -219,7 +252,8 @@ def test_learner_warms_replay_without_update_debt(monkeypatch):
     assert resumed_versions[0].item() == resumed.env_steps
 
     monkeypatch.setattr(learner, "_should_save_summaries", lambda: True)
-    assert TRAIN_STATS in learner.train(batch)
+    train_stats = learner.train(batch)[TRAIN_STATS]
+    assert {"actor_loss", "actor_q_loss", "actor_action_l2"} <= train_stats.keys()
 
     async_cfg = default_cfg("FAST_TD3", "fasttd3")
     async_cfg.device = "cpu"

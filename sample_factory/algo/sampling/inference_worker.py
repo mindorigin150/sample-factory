@@ -98,9 +98,7 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
         self.request_count = deque(maxlen=50)
 
         if self.device.type != "cpu":
-            # very conservative limit on the minimum number of requests to wait for
-            # this will almost guarantee that the system will continue collecting experience
-            # at max rate even when 2/3 of workers are stuck for some reason (e.g. doing a long env reset)
+            # Keep accelerator inference requests batched while allowing a stuck worker to be bypassed.
             min_num_requests = self.cfg.num_workers // (self.cfg.num_policies * self.cfg.policy_workers_per_policy)
             min_num_requests //= 3
             self.min_num_requests = max(1, min_num_requests)
@@ -346,13 +344,18 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                 policy_outputs = actor_critic(normalized_obs, rnn_states)
                 if self.sonic_decoder is not None:
                     # Keep the full policy action in the trajectory; only body actions
-                    # decoded from the token prefix are sent through env_actions.
-                    decoder_tokens = policy_outputs["actions"]
-                    if "base_token" in normalized_obs:
-                        decoder_tokens = normalized_obs["base_token"] + decoder_tokens
+                    # decoded from SONIC tokens are sent through env_actions.
+                    decoder_state = obs["sonic_state"].to(self.device).float()
+                    if "base_token" in obs:
+                        decoder_tokens = obs["base_token"].to(self.device).float()
+                    elif "reference_token" in obs:
+                        decoder_tokens = obs["reference_token"].to(self.device).float()
+                        decoder_tokens = decoder_tokens + 0.25 * policy_outputs["actions"][..., :64]
+                    else:
+                        decoder_tokens = policy_outputs["actions"][..., :64]
                     policy_outputs["env_actions"] = self.sonic_decoder(
                         decoder_tokens,
-                        normalized_obs["sonic_state"],
+                        decoder_state,
                     )
                 policy_outputs["policy_version"] = torch.empty([num_samples]).fill_(self.param_client.policy_version)
 
@@ -382,15 +385,12 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                 pass
             return
 
-        # Very conservative timer. Only wait a little bit, then continue with what we've got.
         wait_for_min_requests = 0.025
-
         waiting_started = time.time()
         while len(self.requests) < self.min_num_requests and time.time() - waiting_started < wait_for_min_requests:
             try:
                 with self.timing.timeit("wait_policy"), self.timing.add_time("wait_policy_total"):
-                    policy_requests = self.inference_queue.get_many(timeout=0.005)
-                self.requests.extend(policy_requests)
+                    self.requests.extend(self.inference_queue.get_many(timeout=0.005))
             except Empty:
                 pass
 

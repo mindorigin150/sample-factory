@@ -185,11 +185,13 @@ class FastTD3Learner(Learner):
                 self.critic.get_value(F.softmax(actor_dist_1, dim=1)),
                 self.critic.get_value(F.softmax(actor_dist_2, dim=1)),
             )
-            actor_loss = -actor_values.mean()
+            actor_q_loss = -actor_values.mean()
+            actor_action_l2 = actor_actions.square().sum(dim=-1).mean()
+            actor_loss = actor_q_loss + self.cfg.fasttd3_actor_action_l2 * actor_action_l2
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_optimizer.step()
-        return actor_loss.detach()
+        return actor_loss.detach(), actor_q_loss.detach(), actor_action_l2.detach()
 
     def _update(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
         obs = self._flatten_obs(batch["obs"])
@@ -210,11 +212,18 @@ class FastTD3Learner(Learner):
 
         next_train_step = self.train_step + 1
         actor_loss = torch.zeros((), device=self.device)
+        actor_q_loss = torch.zeros((), device=self.device)
+        actor_action_l2 = torch.zeros((), device=self.device)
         if next_train_step % POLICY_DELAY == 0:
             for parameter in self.critic.parameters():
                 parameter.requires_grad_(False)
             with self.param_server.policy_lock:
-                actor_loss = self._actor_step_for_update(obs).clone()
+                actor_loss, actor_q_loss, actor_action_l2 = self._actor_step_for_update(
+                    obs
+                )
+                actor_loss = actor_loss.clone()
+                actor_q_loss = actor_q_loss.clone()
+                actor_action_l2 = actor_action_l2.clone()
             for parameter in self.critic.parameters():
                 parameter.requires_grad_(True)
 
@@ -228,6 +237,8 @@ class FastTD3Learner(Learner):
         return {
             "critic_loss": critic_loss,
             "actor_loss": actor_loss,
+            "actor_q_loss": actor_q_loss,
+            "actor_action_l2": actor_action_l2,
             "q_value": q_value,
         }
 
