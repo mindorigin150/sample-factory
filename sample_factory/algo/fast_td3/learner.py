@@ -104,7 +104,13 @@ class FastTD3Learner(Learner):
             replay_generator.manual_seed(self.cfg.seed)
         self.replay = FlatReplayBuffer(self.cfg.fasttd3_replay_capacity, self.device, replay_generator)
 
-        self.load_from_checkpoint(self.policy_id)
+        if self.cfg.initial_model_path is None:
+            self.load_from_checkpoint(self.policy_id)
+        else:
+            checkpoint_dict = self.load_checkpoint([self.cfg.initial_model_path], self.device)
+            self.actor_critic.load_state_dict(checkpoint_dict["model"])
+            self.critic.load_state_dict(checkpoint_dict["critic"])
+            self.target_critic.load_state_dict(checkpoint_dict["target_critic"])
         self.update_credit = 0
 
         if self.cfg.fasttd3_compile:
@@ -131,6 +137,10 @@ class FastTD3Learner(Learner):
         self.target_critic.load_state_dict(checkpoint_dict["target_critic"])
         self.actor_optimizer.load_state_dict(checkpoint_dict["actor_optimizer"])
         self.critic_optimizer.load_state_dict(checkpoint_dict["critic_optimizer"])
+        if self.device.type != "cuda":
+            for optimizer in (self.actor_optimizer, self.critic_optimizer):
+                for parameter_group in optimizer.param_groups:
+                    parameter_group["capturable"] = False
         self.curr_lr = checkpoint_dict["curr_lr"]
 
     @staticmethod

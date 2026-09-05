@@ -38,6 +38,7 @@ def add_basic_cli_args(p: ArgumentParser):
         help="CPU training is only recommended for smaller e.g. MLP policies",
     )
     p.add_argument("--seed", default=None, type=int, help="Set a fixed seed value")
+    p.add_argument("--initial_model_path", type=str, default=None)
 
 
 def add_rl_args(p: ArgumentParser):
