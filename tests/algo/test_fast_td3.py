@@ -130,12 +130,79 @@ def test_sonic_decoder_uses_only_token_prefix():
     assert calls == ["inputs", "run", "outputs"]
 
 
-def test_c51_projection_preserves_probability_mass():
-    critic = Critic(3, 2)
-    projected = critic.projection(
-        torch.zeros(4, 3), torch.zeros(4, 2), torch.zeros(4), torch.ones(4), torch.ones(4)
-    )
-    assert all(torch.allclose(dist.sum(1), torch.ones(4), atol=1e-6) for dist in projected)
+@pytest.mark.parametrize(
+    ("device", "compiled"),
+    [
+        ("cpu", False),
+        pytest.param(
+            "cuda",
+            False,
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA projection contract"),
+        ),
+        pytest.param(
+            "cuda",
+            True,
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA compile contract"),
+        ),
+    ],
+)
+def test_c51_projection_preserves_probability_mass(device, compiled):
+    device = torch.device(device)
+    critic = Critic(3, 2, device=device)
+
+    obs = torch.zeros(128, 3, device=device)
+    actions = torch.zeros(128, 2, device=device)
+    case_rewards = (-300.0, -250.0, -247.5, -245.0, 0.0, 245.0, 247.5, 250.0, 300.0)
+    rewards = torch.tensor((case_rewards * 15)[:128], device=device)
+    bootstrap = torch.zeros(128, device=device)
+    discount = torch.full((128,), 0.99, device=device)
+
+    def project(rewards, bootstrap, discount):
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        ):
+            return critic.projection(obs, actions, rewards, bootstrap, discount)
+
+    if compiled:
+        project = torch.compile(project, mode="reduce-overhead")
+    with torch.no_grad():
+        projected = project(rewards, bootstrap, discount)
+
+    expected_cases = torch.zeros(len(case_rewards), critic.q_support.numel(), device=device)
+    expected_cases[[0, 1], 0] = 1.0
+    expected_cases[2, :2] = 0.5
+    expected_cases[3, 1] = 1.0
+    expected_cases[4, 50] = 1.0
+    expected_cases[5, 99] = 1.0
+    expected_cases[6, 99:101] = 0.5
+    expected_cases[[7, 8], 100] = 1.0
+    expected = expected_cases.repeat((128 + len(case_rewards) - 1) // len(case_rewards), 1)[:128]
+
+    for dist in projected:
+        torch.testing.assert_close(dist, expected, atol=5e-6, rtol=0)
+        assert torch.all(dist >= 0)
+        assert torch.allclose(dist.sum(1), torch.ones(128, device=device), atol=1e-6)
+        logits = torch.full_like(dist, -1e8)
+        logits.masked_fill_(expected > 0, 0)
+        cross_entropy = -(dist * torch.log_softmax(logits, dim=1)).sum(1)
+        assert torch.all(cross_entropy >= 0)
+
+    continuing_bootstrap = torch.ones(128, device=device)
+    continuing_discount = torch.ones(128, device=device)
+    with torch.no_grad():
+        continuing = project(torch.zeros_like(rewards), continuing_bootstrap, continuing_discount)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        ):
+            continuing_expected = tuple(torch.softmax(critic(obs, actions)[i], dim=1) for i in range(2))
+    for dist, expected_dist in zip(continuing, continuing_expected):
+        torch.testing.assert_close(dist, expected_dist, atol=5e-6, rtol=0)
+        assert torch.all(dist >= 0)
+        assert torch.allclose(dist.sum(1), torch.ones(128, device=device), atol=1e-6)
 
 
 def test_flat_replay_wraps_and_copies():

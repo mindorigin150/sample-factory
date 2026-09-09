@@ -130,11 +130,9 @@ class DistributionalQNetwork(nn.Module):
         b = (target_z - self.v_min) / delta_z
         l = torch.floor(b).long()
         u = torch.ceil(b).long()
-        is_int = l == u
-        l_mask = is_int & (l > 0)
-        u_mask = is_int & (l == 0)
-        l = torch.where(l_mask, l - 1, l)
-        u = torch.where(u_mask, u + 1, u)
+        # Explicit exact-bin weights prevent compiled FP32 FMA from creating negative mass.
+        lower_weight = torch.where(l == u, 1.0, u.float() - b)
+        upper_weight = torch.where(l == u, 0.0, b - l.float())
 
         next_dist = F.softmax(self(obs, actions), dim=1)
         projected = torch.zeros_like(next_dist)
@@ -145,10 +143,10 @@ class DistributionalQNetwork(nn.Module):
             .expand(-1, self.num_atoms)
         )
         projected.view(-1).index_add_(
-            0, (l + offsets).reshape(-1), (next_dist * (u.float() - b)).reshape(-1)
+            0, (l + offsets).reshape(-1), (next_dist * lower_weight).reshape(-1)
         )
         projected.view(-1).index_add_(
-            0, (u + offsets).reshape(-1), (next_dist * (b - l.float())).reshape(-1)
+            0, (u + offsets).reshape(-1), (next_dist * upper_weight).reshape(-1)
         )
         return projected
 
