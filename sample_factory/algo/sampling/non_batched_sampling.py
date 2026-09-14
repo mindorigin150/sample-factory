@@ -541,6 +541,7 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
             actor_state = env_actor_states[agent_i]
 
             if self.cfg.algo == "FAST_TD3":
+                actor_state.curr_traj_buffer["env_ids"][self.rollout_step] = actor_state.global_env_idx
                 done = terminated[agent_i] or truncated[agent_i]
                 next_obs = infos[agent_i]["final_observation"] if done else new_obs[agent_i]
                 actor_state.curr_traj_buffer["next_obs"][self.rollout_step] = next_obs

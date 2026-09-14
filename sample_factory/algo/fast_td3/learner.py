@@ -13,7 +13,7 @@ from sample_factory.algo.fast_td3.models import (
     Critic,
     FastTD3ActorCritic,
 )
-from sample_factory.algo.fast_td3.replay import FlatReplayBuffer
+from sample_factory.algo.fast_td3.replay import ChunkExecutionReplayBuffer, FlatReplayBuffer
 from sample_factory.algo.learning.learner import Learner, model_initialization_data
 from sample_factory.algo.utils.env_info import EnvInfo
 from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, POLICY_ID_KEY, STATS_KEY, TRAIN_STATS
@@ -34,7 +34,7 @@ WEIGHT_DECAY = 0.1
 
 
 class FastTD3Learner(Learner):
-    """FastTD3's flat-replay learner behind Sample Factory's LearnerWorker API."""
+    """FastTD3 learner; H8 replay stitches issue decisions to their execution segments."""
 
     def __init__(
         self,
@@ -54,6 +54,7 @@ class FastTD3Learner(Learner):
         self.update_credit = 0
         self._actor_step_for_update = None
         self._critic_step_for_update = None
+        self.action_chunk_horizon = cfg.fasttd3_action_chunk_horizon
 
     def init(self):
         if self.cfg.seed is not None:
@@ -67,6 +68,9 @@ class FastTD3Learner(Learner):
 
         obs_dim = math.prod(self.env_info.obs_space["obs"].shape)
         action_dim = self.env_info.action_space.shape[0]
+        action_chunks = self.action_chunk_horizon > 1
+        if action_chunks:
+            obs_dim += self.action_chunk_horizon
         self.critic = Critic(
             obs_dim,
             action_dim,
@@ -102,9 +106,16 @@ class FastTD3Learner(Learner):
             replay_generator.seed()
         else:
             replay_generator.manual_seed(self.cfg.seed)
-        self.replay = FlatReplayBuffer(self.cfg.fasttd3_replay_capacity, self.device, replay_generator)
+        if action_chunks:
+            self.replay = ChunkExecutionReplayBuffer(
+                self.cfg.fasttd3_replay_capacity, self.device, replay_generator,
+                num_envs=self.cfg.num_workers * self.cfg.num_envs_per_worker,
+                gamma=self.cfg.gamma, horizon=self.action_chunk_horizon,
+            )
+        else:
+            self.replay = FlatReplayBuffer(self.cfg.fasttd3_replay_capacity, self.device, replay_generator)
 
-        if self.cfg.initial_model_path is None:
+        if self.cfg.restart_behavior == "resume" or self.cfg.initial_model_path is None:
             self.load_from_checkpoint(self.policy_id)
         else:
             checkpoint_dict = self.load_checkpoint([self.cfg.initial_model_path], self.device)
@@ -147,7 +158,14 @@ class FastTD3Learner(Learner):
     def _flatten_obs(obs: Tensor) -> Tensor:
         return obs.reshape(obs.shape[0], -1)
 
-    def _critic_step(self, obs, next_obs, actions, rewards, bootstrap, discount):
+    def _chunk_critic_actions(self, actions, critic_obs):
+        mask = (critic_obs[:, 198:] > 0).repeat_interleave(
+            actions.shape[1] // self.action_chunk_horizon, dim=1
+        )
+        return actions * mask
+
+    def _critic_step(self, obs, next_obs, actions, rewards, bootstrap, discount,
+                     critic_obs=None, critic_next_obs=None):
         with torch.autocast(
             device_type=self.device.type,
             dtype=torch.bfloat16,
@@ -159,8 +177,12 @@ class FastTD3Learner(Learner):
                     -TARGET_NOISE_CLIP, TARGET_NOISE_CLIP
                 )
                 target_actions = (target_actions + target_noise).clamp(-1.0, 1.0)
+                target_obs = next_obs
+                if self.action_chunk_horizon > 1:
+                    target_obs = critic_next_obs
+                    target_actions = self._chunk_critic_actions(target_actions, critic_next_obs)
                 target_dist_1, target_dist_2 = self.target_critic.projection(
-                    next_obs, target_actions, rewards, bootstrap, discount
+                    target_obs, target_actions, rewards, bootstrap, discount
                 )
                 target_value_1 = self.target_critic.get_value(target_dist_1)
                 target_value_2 = self.target_critic.get_value(target_dist_2)
@@ -170,7 +192,10 @@ class FastTD3Learner(Learner):
                     target_dist_2,
                 )
 
-            current_dist_1, current_dist_2 = self.critic(obs, actions)
+            if self.action_chunk_horizon > 1:
+                current_dist_1, current_dist_2 = self.critic(critic_obs, self._chunk_critic_actions(actions, critic_obs))
+            else:
+                current_dist_1, current_dist_2 = self.critic(obs, actions)
             critic_loss = -(
                 target_dist * F.log_softmax(current_dist_1, dim=1)
             ).sum(dim=1).mean()
@@ -183,14 +208,19 @@ class FastTD3Learner(Learner):
         self.critic_optimizer.step()
         return critic_loss.detach(), target_value_1.mean().detach()
 
-    def _actor_step(self, obs):
+    def _actor_step(self, obs, critic_obs=None):
         with torch.autocast(
             device_type=self.device.type,
             dtype=torch.bfloat16,
             enabled=self.device.type == "cuda",
         ):
             actor_actions = self.actor_critic.actor(obs)
-            actor_dist_1, actor_dist_2 = self.critic(obs, actor_actions)
+            value_obs = obs
+            if self.action_chunk_horizon > 1:
+                value_obs = critic_obs
+                # Physical termination censors rewards, not the current actor's planned suffix.
+                actor_actions = self._chunk_critic_actions(actor_actions, critic_obs)
+            actor_dist_1, actor_dist_2 = self.critic(value_obs, actor_actions)
             actor_values = torch.minimum(
                 self.critic.get_value(F.softmax(actor_dist_1, dim=1)),
                 self.critic.get_value(F.softmax(actor_dist_2, dim=1)),
@@ -209,13 +239,23 @@ class FastTD3Learner(Learner):
         with self.param_server.policy_lock:
             obs = self.actor_critic.empirical_obs_normalizer(obs)
             next_obs = self.actor_critic.empirical_obs_normalizer(next_obs)
+            critic_obs = critic_next_obs = None
+            if self.action_chunk_horizon > 1:
+                critic_obs = torch.cat((
+                    self.actor_critic.empirical_obs_normalizer(batch["critic_obs"][:, :198], update_stats=False),
+                    batch["critic_obs"][:, 198:],
+                ), dim=1)
+                critic_next_obs = torch.cat((
+                    self.actor_critic.empirical_obs_normalizer(batch["critic_next_obs"][:, :198], update_stats=False),
+                    batch["critic_next_obs"][:, 198:],
+                ), dim=1)
         actions = batch["actions"]
         rewards = batch["rewards"]
         bootstrap = (batch["timeouts"] | ~batch["dones"]).float()
-        discount = torch.full_like(rewards, self.cfg.gamma)
+        discount = batch["discount"] if self.action_chunk_horizon > 1 else torch.full_like(rewards, self.cfg.gamma)
 
         critic_loss, q_value = self._critic_step_for_update(
-            obs, next_obs, actions, rewards, bootstrap, discount
+            obs, next_obs, actions, rewards, bootstrap, discount, critic_obs, critic_next_obs
         )
         critic_loss = critic_loss.clone()
         q_value = q_value.clone()
@@ -229,7 +269,7 @@ class FastTD3Learner(Learner):
                 parameter.requires_grad_(False)
             with self.param_server.policy_lock:
                 actor_loss, actor_q_loss, actor_action_l2 = self._actor_step_for_update(
-                    obs
+                    obs, critic_obs
                 )
                 actor_loss = actor_loss.clone()
                 actor_q_loss = actor_q_loss.clone()
@@ -244,13 +284,20 @@ class FastTD3Learner(Learner):
             torch._foreach_add_(target_parameters, parameters, alpha=TAU)
 
         self.train_step = next_train_step
-        return {
+        stats = {
             "critic_loss": critic_loss,
             "actor_loss": actor_loss,
             "actor_q_loss": actor_q_loss,
             "actor_action_l2": actor_action_l2,
             "q_value": q_value,
         }
+        if self.action_chunk_horizon > 1:
+            active = batch["execution_counts"].bool()
+            stats["actor_credit_fraction"] = (batch["critic_obs"][:, 198:] > 0).float().mean()
+            stats["execution_length_mean"] = batch["execution_counts"].sum(dim=1).mean()
+            for index in range(self.action_chunk_horizon):
+                stats[f"execution_index_{index}_fraction"] = active[:, index].float().mean()
+        return stats
 
     def train(self, batch: TensorDict):
         self.actor_critic.train()
@@ -265,7 +312,17 @@ class FastTD3Learner(Learner):
         with self.timing.add_time("replay_add"):
             with torch.no_grad(), self.param_server.policy_lock:
                 self.actor_critic.empirical_obs_normalizer(observations.to(self.device))
-            self.replay.add_batch(observations, actions, rewards, next_observations, dones, timeouts)
+            if self.action_chunk_horizon > 1:
+                clock = batch["obs"]["replay_clock"][:, :-1].flatten(0, 1)
+                next_clock = batch["next_obs"]["replay_clock"].flatten(0, 1)
+                self.replay.add_batch(
+                    observations, actions, rewards, next_observations, dones, timeouts,
+                    env_ids=batch["env_ids"].flatten(), frames=clock[:, 1], episodes=clock[:, 0],
+                    applied_sources=next_clock[:, 2], applied_indices=next_clock[:, 3],
+                    applied_windows=next_clock[:, 5:7], admitted=next_clock[:, 4].bool(),
+                )
+            else:
+                self.replay.add_batch(observations, actions, rewards, next_observations, dones, timeouts)
         self.env_steps += rewards.shape[0]
         if previous_replay_size >= LEARNING_START_TRANSITIONS:
             self.update_credit += rewards.shape[0]
@@ -273,7 +330,7 @@ class FastTD3Learner(Learner):
         stats = {}
         while (
             self.update_credit >= self.cfg.fasttd3_transitions_per_update
-            and len(self.replay) >= LEARNING_START_TRANSITIONS
+            and (len(self.replay) > 0 if self.action_chunk_horizon > 1 else len(self.replay) >= LEARNING_START_TRANSITIONS)
         ):
             with self.timing.add_time("replay_sample"):
                 replay_batch = self.replay.sample(self.cfg.fasttd3_replay_batch_size)
@@ -289,6 +346,9 @@ class FastTD3Learner(Learner):
             POLICY_ID_KEY: self.policy_id,
             STATS_KEY: {"replay": len(self.replay), "update_credit": self.update_credit},
         }
+        if self.action_chunk_horizon > 1:
+            report[STATS_KEY].update(execution_events=self.replay.execution_events,
+                                   timeout_censored_segments=self.replay.censored_segments)
         if stats and self._should_save_summaries():
             self.last_summary_time = time.time()
             report[TRAIN_STATS] = {name: value.item() for name, value in stats.items()}

@@ -113,6 +113,8 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
     tensors["dones"].fill_(True)
     tensors["time_outs"] = init_tensor([num_traj, rollout], torch.bool, [], device, share)
     tensors["time_outs"].fill_(False)  # no timeouts by default
+    if algo == "FAST_TD3":
+        tensors["env_ids"] = init_tensor([num_traj, rollout], torch.int64, [], device, share)
     tensors["policy_id"] = init_tensor([num_traj, rollout], torch.int, [], device, share)
     tensors["policy_id"].fill_(-1)  # -1 is an invalid policy index, experience from policy "-1" is always ignored
     tensors["valids"] = init_tensor([num_traj, rollout + 1], torch.bool, [], device, share)

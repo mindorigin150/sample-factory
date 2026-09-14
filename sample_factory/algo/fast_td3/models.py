@@ -39,8 +39,8 @@ class EmpiricalNormalization(nn.Module):
         return self._std.squeeze(0).clone()
 
     @torch.no_grad()
-    def forward(self, x: Tensor) -> Tensor:
-        if self.training:
+    def forward(self, x: Tensor, update_stats: bool = True) -> Tensor:
+        if self.training and update_stats:
             self.update(x)
         return (x - self._mean) / (self._std + self.eps)
 
@@ -53,10 +53,9 @@ class EmpiricalNormalization(nn.Module):
         new_count = self.count + batch_size
         delta = batch_mean - self._mean
         self._mean.copy_(self._mean + delta * (batch_size / new_count))
-        delta2 = batch_mean - self._mean
         m_a = self._var * self.count
         m_b = batch_var * batch_size
-        m2 = m_a + m_b + delta2.square() * (self.count * batch_size / new_count)
+        m2 = m_a + m_b + delta.square() * (self.count * batch_size / new_count)
         self._var.copy_(m2 / new_count)
         self._std.copy_(self._var.sqrt())
         self.count.copy_(new_count)

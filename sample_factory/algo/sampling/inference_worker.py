@@ -62,6 +62,9 @@ def init_inference_process(sf_context: SampleFactoryContext, worker: InferenceWo
     if cfg.device == "gpu":
         cuda_envvars_for_policy(worker.policy_id, "inference")
     init_torch_runtime(cfg)
+    if cfg.algo == "FAST_TD3" and cfg.seed is not None:
+        # Exploration is sampled here, in a separate process from the seeded learner.
+        torch.manual_seed(cfg.seed + worker.policy_id * cfg.policy_workers_per_policy + worker.worker_idx)
 
 
 class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):

@@ -1,3 +1,4 @@
+from copy import deepcopy
 from types import SimpleNamespace
 
 import numpy as np
@@ -6,8 +7,8 @@ import torch
 from gymnasium import spaces
 
 from sample_factory.algo.fast_td3.learner import FastTD3Learner
-from sample_factory.algo.fast_td3.models import Critic, FastTD3ActorCritic
-from sample_factory.algo.fast_td3.replay import FlatReplayBuffer
+from sample_factory.algo.fast_td3.models import Critic, EmpiricalNormalization, FastTD3ActorCritic
+from sample_factory.algo.fast_td3.replay import ChunkExecutionReplayBuffer, FlatReplayBuffer
 from sample_factory.algo.fast_td3.sonic import SonicCudaDecoder
 from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, TRAIN_STATS
 from sample_factory.algo.utils.model_sharing import ParameterClientAsync, ParameterServer
@@ -21,6 +22,29 @@ def _spaces():
         spaces.Dict({"obs": spaces.Box(-1.0, 1.0, (3,), dtype=np.float32)}),
         spaces.Box(-1.0, 1.0, (2,), dtype=np.float32),
     )
+
+
+def test_fasttd3_inference_process_seeds_exploration(monkeypatch):
+    from sample_factory.algo.sampling import inference_worker
+    from sample_factory.algo.utils.context import sf_global_context
+
+    cfg = default_cfg("FAST_TD3", "fasttd3")
+    cfg.device = "cpu"
+    cfg.num_workers = 1
+    cfg.seed = 17
+    cfg.policy_workers_per_policy = 2
+    worker = SimpleNamespace(cfg=cfg, object_id="seed test", policy_id=1, worker_idx=1)
+    monkeypatch.setattr(inference_worker, "init_file_logger", lambda _: None)
+    monkeypatch.setattr(inference_worker, "init_torch_runtime", lambda _: None)
+    monkeypatch.setattr("signal.signal", lambda *_: None)
+    with torch.random.fork_rng(devices=[]):
+        inference_worker.init_inference_process(sf_global_context(), worker)
+        first = torch.randn_like(torch.zeros(4, 344))
+        inference_worker.init_inference_process(sf_global_context(), worker)
+        torch.testing.assert_close(torch.randn_like(torch.zeros(4, 344)), first, rtol=0, atol=0)
+        cfg.seed += 1
+        inference_worker.init_inference_process(sf_global_context(), worker)
+        assert not torch.equal(torch.randn_like(torch.zeros(4, 344)), first)
 
 
 def test_actor_uses_sf_contract_and_carries_noise_scale():
@@ -58,6 +82,7 @@ def test_actor_action_l2_is_weighted_and_reported(coefficient):
             return probabilities[:, 0]
 
     learner = FastTD3Learner.__new__(FastTD3Learner)
+    learner.action_chunk_horizon = 1
     learner.device = torch.device("cpu")
     learner.cfg = SimpleNamespace(fasttd3_actor_action_l2=coefficient)
     learner.actor_critic = SimpleNamespace(actor=Actor())
@@ -396,3 +421,225 @@ def test_compiled_updates_keep_stats_and_optimizer_state(monkeypatch, tmp_path):
     assert all(torch.isfinite(torch.tensor(tuple(report[TRAIN_STATS].values()))).all() for report in reports)
     assert {state["step"].item() for state in learner.critic_optimizer.state.values()} == {4}
     assert {state["step"].item() for state in learner.actor_optimizer.state.values()} == {2}
+
+
+@pytest.mark.parametrize("batches", [
+    (torch.tensor([[0.0], [0.0]]), torch.tensor([[2.0], [2.0]])),
+    (torch.tensor([[1.0, 4.0], [3.0, 2.0]]), torch.tensor([[7.0, -2.0]])),
+])
+def test_empirical_normalization_matches_combined_population(batches):
+    combined = torch.cat(batches)
+    normalizer = EmpiricalNormalization(combined.shape[1], torch.device("cpu"))
+    for batch in batches:
+        normalizer.update(batch)
+    torch.testing.assert_close(normalizer.mean, combined.mean(dim=0))
+    torch.testing.assert_close(normalizer.std.square(), combined.var(dim=0, unbiased=False))
+    assert normalizer.count.item() == combined.shape[0]
+
+
+def test_chunk_execution_replay_credits_only_real_execution_windows():
+    replay = ChunkExecutionReplayBuffer(
+        16,
+        torch.device("cpu"),
+        torch.Generator().manual_seed(0),
+        num_envs=1,
+        gamma=0.5,
+        horizon=4,
+    )
+
+    def add(frame, source, index, reward, *, done=False, timeout=False, buffer=replay, window=None):
+        observation = torch.full((1, 198), float(frame))
+        action = torch.arange(8, dtype=torch.float32).reshape(1, 8) + frame * 10
+        return buffer.add_batch(
+            observation,
+            action,
+            torch.tensor([reward]),
+            observation + 1,
+            torch.tensor([done]),
+            torch.tensor([timeout]),
+            env_ids=torch.tensor([0]),
+            frames=torch.tensor([frame]),
+            episodes=torch.tensor([0]),
+            applied_sources=torch.tensor([source]),
+            applied_indices=torch.tensor([index]),
+            applied_windows=torch.tensor([[index, index + 2] if window is None else window]),
+            admitted=torch.tensor([True]),
+        )
+
+    add(0, -1, -1, 0.0)
+    add(1, -1, -1, 0.0)
+    add(2, 0, 2, 1.0)
+    add(3, 0, 3, 2.0)
+    assert add(4, 2, 2, 4.0) == 1
+    add(5, 2, 3, 8.0)
+    assert add(6, 4, 2, 16.0, done=True) == 2
+
+    assert len(replay) == 3
+    torch.testing.assert_close(replay.storage["obs"][:3, 0], torch.tensor([0.0, 2.0, 4.0]))
+    torch.testing.assert_close(replay.storage["critic_obs"][:3, 0], torch.tensor([2.0, 4.0, 6.0]))
+    torch.testing.assert_close(replay.storage["critic_next_obs"][:3, 0], torch.tensor([4.0, 6.0, 7.0]))
+    torch.testing.assert_close(replay.storage["rewards"][:3], torch.tensor([2.0, 8.0, 16.0]))
+    torch.testing.assert_close(replay.storage["discount"][:3], torch.tensor([0.25, 0.25, 0.5]))
+    torch.testing.assert_close(
+        replay.storage["execution_counts"][:3],
+        torch.tensor([[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 0.0]]),
+    )
+    torch.testing.assert_close(replay.storage["critic_obs"][:3, 198:], torch.tensor([[0., 0., 1., 1.]]).expand(3, -1))
+    torch.testing.assert_close(replay.storage["critic_next_obs"][2, 198:], torch.zeros(4))
+    assert replay.storage["dones"][:2].logical_not().all()
+    assert replay.storage["dones"][2]
+
+    timeout_replay = ChunkExecutionReplayBuffer(
+        4,
+        torch.device("cpu"),
+        torch.Generator().manual_seed(0),
+        num_envs=1,
+        gamma=0.5,
+        horizon=4,
+    )
+    assert add(0, 0, 0, 1.0, done=True, timeout=True, buffer=timeout_replay) == 0
+    assert timeout_replay.censored_segments == 1
+    add(1, 1, 0, 2.0, buffer=timeout_replay)
+    assert add(2, 2, 0, 4.0, done=True, timeout=True, buffer=timeout_replay) == 1
+    assert len(timeout_replay) == 1
+    assert timeout_replay.censored_segments == 2
+    torch.testing.assert_close(timeout_replay.storage["rewards"][:1], torch.tensor([2.0]))
+    torch.testing.assert_close(timeout_replay.storage["discount"][:1], torch.tensor([0.5]))
+    assert not timeout_replay.storage["dones"][0]
+
+
+    tail = ChunkExecutionReplayBuffer(8, torch.device("cpu"), torch.Generator().manual_seed(0), num_envs=1, gamma=0.5, horizon=4)
+    add(0, -1, -1, 0., buffer=tail)
+    add(1, -1, -1, 0., buffer=tail)
+    for frame in range(2, 7):
+        add(frame, 0, min(frame, 3), 2. ** (frame - 2), done=frame == 6, buffer=tail, window=(2, 7))
+    torch.testing.assert_close(tail.storage["critic_obs"][0, 198:], torch.tensor([0., 0., 1., 4.]))
+    torch.testing.assert_close(tail.storage["execution_counts"][0], torch.tensor([0., 0., 1., 4.]))
+    torch.testing.assert_close(tail.storage["rewards"][0], torch.tensor(5.))
+    torch.testing.assert_close(tail.storage["discount"][0], torch.tensor(0.5 ** 5))
+
+
+@pytest.mark.parametrize("coefficient", [0.0, 2.5])
+@pytest.mark.parametrize("heads", [[0], [2, 3], [2, 3, 4], [3], [3, 4, 5], [7]])
+def test_chunk_q_and_actor_credit_use_the_planned_window(monkeypatch, coefficient, heads):
+    class Actor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.actions = torch.nn.Parameter(torch.full((1, 16), 0.25))
+
+        def forward(self, obs):
+            return self.actions.expand(obs.shape[0], -1)
+
+    learner = FastTD3Learner.__new__(FastTD3Learner)
+    learner.device = torch.device("cpu")
+    learner.action_chunk_horizon = 8
+    learner.cfg = SimpleNamespace(fasttd3_actor_action_l2=coefficient)
+    planned = torch.zeros(8, dtype=torch.bool)
+    planned[heads] = True
+    planned = planned.repeat_interleave(2)
+    learner.actor_critic = SimpleNamespace(actor=Actor())
+    learner.critic = Critic(206, 16, num_atoms=3)
+    learner.target_critic = deepcopy(learner.critic)
+    learner.actor_optimizer = torch.optim.SGD(learner.actor_critic.actor.parameters(), lr=0.0)
+    learner.critic_optimizer = torch.optim.SGD(learner.critic.parameters(), lr=0.0)
+    current_actions, target_actions = [], []
+    learner.critic.register_forward_pre_hook(lambda module, args: current_actions.append(args[1].detach().clone()))
+    learner.target_critic.qnet1.register_forward_pre_hook(lambda module, args: target_actions.append(args[1].detach().clone()))
+    monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
+    obs = torch.zeros(1, 198)
+    expected = learner.actor_critic.actor(obs).detach() * planned
+    critic_obs = torch.cat((obs, planned.reshape(8, 2)[:, 0].float()[None]), dim=1)
+    next_critic_obs = critic_obs.clone()
+    next_critic_obs[:, 200] = 0
+    next_critic_obs[:, 202:204] = 1
+    next_expected = learner.actor_critic.actor(obs).detach() * (next_critic_obs[:, 198:] > 0).repeat_interleave(2, dim=1)
+
+    learner._critic_step(obs, obs, torch.full((1, 16), 0.25), torch.ones(1), torch.zeros(1), torch.full((1,), 0.99),
+                         critic_obs=critic_obs, critic_next_obs=next_critic_obs)
+    torch.testing.assert_close(current_actions[-1], expected)
+    torch.testing.assert_close(target_actions[-1], next_expected)
+
+    # The preceding critic update represents a terminal behavior transition;
+    # its current-policy replacement still receives credit for both planned actions.
+    loss, q_loss, l2 = learner._actor_step(obs, critic_obs=critic_obs)
+    torch.testing.assert_close(current_actions[-1], expected)
+    torch.testing.assert_close(l2, torch.tensor(2 * len(heads) * 0.25 ** 2))
+    torch.testing.assert_close(loss, q_loss + coefficient * l2)
+    gradient = learner.actor_critic.actor.actions.grad
+    assert (gradient[:, planned] != 0).all()
+    torch.testing.assert_close(gradient[:, ~planned], torch.zeros_like(gradient[:, ~planned]))
+
+
+@pytest.mark.parametrize("device,compiled", [
+    ("cpu", False),
+    pytest.param("gpu", True, marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA compile contract")),
+])
+def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compiled):
+    """Long-lived learner contract: physical actor, planned critic, updates and cold replay resume."""
+    monkeypatch.setattr("sample_factory.algo.fast_td3.learner.LEARNING_START_TRANSITIONS", 2)
+    cfg = default_cfg("FAST_TD3", "chunk_resume")
+    cfg.device = device
+    cfg.train_dir = str(tmp_path)
+    cfg.serial_mode = True
+    cfg.async_rl = False
+    cfg.batched_sampling = False
+    cfg.normalize_input = False
+    cfg.fasttd3_compile = compiled
+    cfg.fasttd3_action_chunk_horizon = 8
+    cfg.fasttd3_replay_capacity = 16
+    cfg.fasttd3_replay_batch_size = 2
+    cfg.fasttd3_transitions_per_update = 1
+    cfg.num_workers = 2
+    cfg.num_envs_per_worker = 1
+    obs_space = spaces.Dict({
+        "obs": spaces.Box(-1.0, 1.0, (198,), dtype=np.float32),
+        "replay_clock": spaces.Box(-1, 100, (7,), dtype=np.int64),
+    })
+    action_space = spaces.Box(-1.0, 1.0, (344,), dtype=np.float32)
+    env_info = SimpleNamespace(obs_space=obs_space, action_space=action_space)
+    versions = torch.zeros(1, dtype=torch.int64)
+    learner = FastTD3Learner(cfg, env_info, versions, 0, ParameterServer(0, versions, True))
+    learner.init()
+    monkeypatch.setattr(learner, "_should_save_summaries", lambda: True)
+
+    def train_frame(target, frame):
+        clock = torch.tensor([0, frame, -1, -1, 0, -1, -1]).expand(2, 2, -1).clone()
+        next_clock = torch.tensor([0, frame + 1, frame, 0, 1, 0, 1]).expand(2, 1, -1).clone()
+        return target.train({
+            "obs": {"obs": torch.full((2, 2, 198), frame * 0.1), "replay_clock": clock},
+            "next_obs": {"obs": torch.full((2, 1, 198), (frame + 1) * 0.1), "replay_clock": next_clock},
+            "actions": torch.zeros(2, 1, 344),
+            "rewards": torch.ones(2, 1),
+            "dones": torch.zeros(2, 1, dtype=torch.bool),
+            "time_outs": torch.zeros(2, 1, dtype=torch.bool),
+            "env_ids": torch.arange(2).reshape(2, 1),
+        })
+
+    for frame in range(4):
+        report = train_frame(learner, frame)
+    assert learner.train_step == 4
+    assert all(np.isfinite(value) for value in report[TRAIN_STATS].values())
+    assert report[TRAIN_STATS]["actor_action_l2"] > 0
+    physical = torch.zeros(2, 198, device=learner.device)
+    assert learner.actor_critic.actor(physical).shape == (2, 344)
+    assert learner.replay.storage["critic_obs"].shape == (16, 206)
+    counts = torch.tensor([[1.0, 0, 0, 0, 0, 0, 0, 0]], device=learner.device).expand(6, -1)
+    torch.testing.assert_close(learner.replay.storage["critic_obs"][:6, 198:], counts)
+    assert {state["step"].item() for state in learner.critic_optimizer.state.values()} == {4}
+    assert {state["step"].item() for state in learner.actor_optimizer.state.values()} == {2}
+
+    checkpoint = deepcopy(learner._get_checkpoint_dict())
+    cfg.restart_behavior = "resume"
+    cfg.initial_model_path = str(tmp_path / "unused_teacher.pth")
+    resumed = FastTD3Learner(cfg, env_info, versions, 0, ParameterServer(0, versions, True))
+    monkeypatch.setattr(resumed, "load_from_checkpoint", lambda policy_id: resumed._load_state(checkpoint))
+    resumed.init()
+    assert (resumed.train_step, resumed.env_steps, len(resumed.replay), resumed.update_credit) == (4, 8, 0, 0)
+    torch.testing.assert_close(resumed.actor_critic.state_dict(), checkpoint["model"])
+    torch.testing.assert_close(resumed.critic.state_dict(), checkpoint["critic"])
+    torch.testing.assert_close(resumed.target_critic.state_dict(), checkpoint["target_critic"])
+    torch.testing.assert_close(resumed.actor_optimizer.state_dict(), checkpoint["actor_optimizer"])
+    torch.testing.assert_close(resumed.critic_optimizer.state_dict(), checkpoint["critic_optimizer"])
+    train_frame(resumed, 4)
+    assert resumed.train_step == 4
+    assert resumed.update_credit == 0
