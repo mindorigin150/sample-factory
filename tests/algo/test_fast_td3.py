@@ -10,6 +10,7 @@ from sample_factory.algo.fast_td3.learner import FastTD3Learner
 from sample_factory.algo.fast_td3.models import Critic, EmpiricalNormalization, FastTD3ActorCritic
 from sample_factory.algo.fast_td3.replay import ChunkExecutionReplayBuffer, FlatReplayBuffer
 from sample_factory.algo.fast_td3.sonic import SonicCudaDecoder
+from sample_factory.algo.sampling.non_batched_sampling import ActorState
 from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, TRAIN_STATS
 from sample_factory.algo.utils.model_sharing import ParameterClientAsync, ParameterServer
 from sample_factory.algo.utils.shared_buffers import alloc_policy_output_tensors
@@ -437,7 +438,8 @@ def test_empirical_normalization_matches_combined_population(batches):
     assert normalizer.count.item() == combined.shape[0]
 
 
-def test_chunk_execution_replay_credits_only_real_execution_windows():
+@pytest.mark.parametrize("obs_dim", [3, 198])
+def test_chunk_execution_replay_credits_only_real_execution_windows(obs_dim):
     replay = ChunkExecutionReplayBuffer(
         16,
         torch.device("cpu"),
@@ -448,22 +450,14 @@ def test_chunk_execution_replay_credits_only_real_execution_windows():
     )
 
     def add(frame, source, index, reward, *, done=False, timeout=False, buffer=replay, window=None):
-        observation = torch.full((1, 198), float(frame))
+        observation = torch.full((1, obs_dim), float(frame))
         action = torch.arange(8, dtype=torch.float32).reshape(1, 8) + frame * 10
+        start, end = (index, index + 2) if window is None else window
         return buffer.add_batch(
-            observation,
-            action,
-            torch.tensor([reward]),
-            observation + 1,
-            torch.tensor([done]),
-            torch.tensor([timeout]),
-            env_ids=torch.tensor([0]),
-            frames=torch.tensor([frame]),
-            episodes=torch.tensor([0]),
-            applied_sources=torch.tensor([source]),
-            applied_indices=torch.tensor([index]),
-            applied_windows=torch.tensor([[index, index + 2] if window is None else window]),
-            admitted=torch.tensor([True]),
+            observation, action, torch.tensor([done]), torch.tensor([timeout]),
+            env_ids=torch.tensor([0]), raw_obs=torch.stack((observation, observation + 1), dim=1),
+            rewards=torch.tensor([[reward]]), lengths=torch.tensor([1]),
+            clock=torch.tensor([[[0, frame, source, index, 1, start, end]]]),
         )
 
     add(0, -1, -1, 0.0)
@@ -484,8 +478,8 @@ def test_chunk_execution_replay_credits_only_real_execution_windows():
         replay.storage["execution_counts"][:3],
         torch.tensor([[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 0.0]]),
     )
-    torch.testing.assert_close(replay.storage["critic_obs"][:3, 198:], torch.tensor([[0., 0., 1., 1.]]).expand(3, -1))
-    torch.testing.assert_close(replay.storage["critic_next_obs"][2, 198:], torch.zeros(4))
+    torch.testing.assert_close(replay.storage["critic_obs"][:3, obs_dim:], torch.tensor([[0., 0., 1., 1.]]).expand(3, -1))
+    torch.testing.assert_close(replay.storage["critic_next_obs"][2, obs_dim:], torch.zeros(4))
     assert replay.storage["dones"][:2].logical_not().all()
     assert replay.storage["dones"][2]
 
@@ -513,15 +507,70 @@ def test_chunk_execution_replay_credits_only_real_execution_windows():
     add(1, -1, -1, 0., buffer=tail)
     for frame in range(2, 7):
         add(frame, 0, min(frame, 3), 2. ** (frame - 2), done=frame == 6, buffer=tail, window=(2, 7))
-    torch.testing.assert_close(tail.storage["critic_obs"][0, 198:], torch.tensor([0., 0., 1., 4.]))
+    torch.testing.assert_close(tail.storage["critic_obs"][0, obs_dim:], torch.tensor([0., 0., 1., 4.]))
     torch.testing.assert_close(tail.storage["execution_counts"][0], torch.tensor([0., 0., 1., 4.]))
     torch.testing.assert_close(tail.storage["rewards"][0], torch.tensor(5.))
     torch.testing.assert_close(tail.storage["discount"][0], torch.tensor(0.5 ** 5))
 
 
+@pytest.mark.parametrize("stride", [1, 2, 3])
+@pytest.mark.parametrize("timeout", [False, True])
+def test_chunk_replay_is_independent_of_raw_trace_grouping(stride, timeout):
+    """Long-lived replay contract: source credit and censoring use actual raw transitions."""
+    replay = ChunkExecutionReplayBuffer(16, torch.device("cpu"), None, num_envs=1, gamma=0.5, horizon=4)
+    for boundary in range(0, 15, stride):
+        length = min(stride, 15 - boundary)
+        clock = []
+        for frame in range(boundary, boundary + length):
+            source = ((frame - 1) // 6) * 6 if frame else -1
+            clock.append([0, frame, source, min(frame - source, 3) if source >= 0 else -1,
+                          frame % 6 == 0, 1, 7])
+        raw_obs = torch.arange(boundary, boundary + stride + 1).float().reshape(1, stride + 1, 1).expand(1, -1, 17)
+        replay.add_batch(
+            torch.full((1, 17), float(boundary)), torch.full((1, 4), float(boundary)),
+            torch.tensor([boundary + length == 15]), torch.tensor([timeout and boundary + length == 15]),
+            env_ids=torch.tensor([0]), raw_obs=raw_obs,
+            rewards=torch.arange(boundary, boundary + stride).float()[None],
+            clock=torch.tensor([clock + [[-1] * 7] * (stride - length)]), lengths=torch.tensor([length]),
+        )
+    count = 2 if timeout else 3
+    assert len(replay) == count
+    assert replay.censored_segments == timeout
+    torch.testing.assert_close(replay.storage["obs"][:count, 0], torch.tensor([0., 6., 12.])[:count])
+    torch.testing.assert_close(replay.storage["actions"][:count, 0], torch.tensor([0., 6., 12.])[:count])
+    torch.testing.assert_close(replay.storage["critic_obs"][:count, 0], torch.tensor([1., 7., 13.])[:count])
+    torch.testing.assert_close(replay.storage["critic_obs"][:count, -4:], torch.tensor([[0., 1., 1., 4.]]).expand(count, -1))
+    expected_rewards = [sum(0.5 ** i * (start + i) for i in range(length)) for start, length in [(1, 6), (7, 6), (13, 2)]]
+    torch.testing.assert_close(replay.storage["rewards"][:count], torch.tensor(expected_rewards)[:count])
+    torch.testing.assert_close(replay.storage["discount"][:count], torch.tensor([0.5 ** 6, 0.5 ** 6, 0.5 ** 2])[:count])
+    torch.testing.assert_close(replay.storage["next_obs"][:2, 0], torch.tensor([6., 12.]))
+    torch.testing.assert_close(replay.storage["critic_next_obs"][:2, 0], torch.tensor([7., 13.]))
+    if not timeout:
+        assert replay.storage["dones"][2]
+        torch.testing.assert_close(replay.storage["critic_next_obs"][2, -4:], torch.zeros(4))
+
+
+@pytest.mark.parametrize("terminated,truncated", [(True, False), (False, True), (True, True)])
+def test_fasttd3_sampling_preserves_physical_terminal_precedence(terminated, truncated):
+    """Long-lived sampling/replay contract: a physical terminal is never timeout-censored."""
+    actor = ActorState.__new__(ActorState)
+    actor.cfg = SimpleNamespace(algo="FAST_TD3", summaries_use_frameskip=False)
+    actor.curr_traj_buffer = {name: torch.zeros(1) for name in ("rewards", "dones", "time_outs", "policy_id")}
+    actor.is_active = True
+    actor.curr_policy_id = actor.agent_idx = actor.env_idx = actor.global_env_idx = 0
+    actor.last_episode_duration = 0
+    actor.policy_mgr = SimpleNamespace(get_policy_for_agent=lambda *_: 0)
+    actor._episodic_stats = lambda _: {}
+    actor._update_training_info = lambda: None
+    actor.record_env_step(1., terminated, truncated, {}, 0)
+    assert actor.curr_traj_buffer["dones"][0]
+    assert actor.curr_traj_buffer["time_outs"][0] == (truncated and not terminated)
+
+
 @pytest.mark.parametrize("coefficient", [0.0, 2.5])
 @pytest.mark.parametrize("heads", [[0], [2, 3], [2, 3, 4], [3], [3, 4, 5], [7]])
-def test_chunk_q_and_actor_credit_use_the_planned_window(monkeypatch, coefficient, heads):
+@pytest.mark.parametrize("obs_dim", [3, 198])
+def test_chunk_q_and_actor_credit_use_the_planned_window(monkeypatch, coefficient, heads, obs_dim):
     class Actor(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -538,7 +587,7 @@ def test_chunk_q_and_actor_credit_use_the_planned_window(monkeypatch, coefficien
     planned[heads] = True
     planned = planned.repeat_interleave(2)
     learner.actor_critic = SimpleNamespace(actor=Actor())
-    learner.critic = Critic(206, 16, num_atoms=3)
+    learner.critic = Critic(obs_dim + 8, 16, num_atoms=3)
     learner.target_critic = deepcopy(learner.critic)
     learner.actor_optimizer = torch.optim.SGD(learner.actor_critic.actor.parameters(), lr=0.0)
     learner.critic_optimizer = torch.optim.SGD(learner.critic.parameters(), lr=0.0)
@@ -546,13 +595,13 @@ def test_chunk_q_and_actor_credit_use_the_planned_window(monkeypatch, coefficien
     learner.critic.register_forward_pre_hook(lambda module, args: current_actions.append(args[1].detach().clone()))
     learner.target_critic.qnet1.register_forward_pre_hook(lambda module, args: target_actions.append(args[1].detach().clone()))
     monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
-    obs = torch.zeros(1, 198)
+    obs = torch.zeros(1, obs_dim)
     expected = learner.actor_critic.actor(obs).detach() * planned
     critic_obs = torch.cat((obs, planned.reshape(8, 2)[:, 0].float()[None]), dim=1)
     next_critic_obs = critic_obs.clone()
-    next_critic_obs[:, 200] = 0
-    next_critic_obs[:, 202:204] = 1
-    next_expected = learner.actor_critic.actor(obs).detach() * (next_critic_obs[:, 198:] > 0).repeat_interleave(2, dim=1)
+    next_critic_obs[:, obs_dim + 2] = 0
+    next_critic_obs[:, obs_dim + 4:obs_dim + 6] = 1
+    next_expected = learner.actor_critic.actor(obs).detach() * (next_critic_obs[:, obs_dim:] > 0).repeat_interleave(2, dim=1)
 
     learner._critic_step(obs, obs, torch.full((1, 16), 0.25), torch.ones(1), torch.zeros(1), torch.full((1,), 0.99),
                          critic_obs=critic_obs, critic_next_obs=next_critic_obs)
@@ -574,7 +623,8 @@ def test_chunk_q_and_actor_credit_use_the_planned_window(monkeypatch, coefficien
     ("cpu", False),
     pytest.param("gpu", True, marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA compile contract")),
 ])
-def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compiled):
+@pytest.mark.parametrize("obs_dim,action_dim,stride,horizon", [(3, 1, 2, 4), (17, 6, 3, 8), (198, 43, 1, 8)])
+def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compiled, obs_dim, action_dim, stride, horizon):
     """Long-lived learner contract: physical actor, planned critic, updates and cold replay resume."""
     monkeypatch.setattr("sample_factory.algo.fast_td3.learner.LEARNING_START_TRANSITIONS", 2)
     cfg = default_cfg("FAST_TD3", "chunk_resume")
@@ -585,17 +635,22 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     cfg.batched_sampling = False
     cfg.normalize_input = False
     cfg.fasttd3_compile = compiled
-    cfg.fasttd3_action_chunk_horizon = 8
+    cfg.fasttd3_action_chunk_horizon = horizon
     cfg.fasttd3_replay_capacity = 16
     cfg.fasttd3_replay_batch_size = 2
-    cfg.fasttd3_transitions_per_update = 1
+    cfg.fasttd3_transitions_per_update = stride
+    cfg.reward_scale = 2.0
+    cfg.reward_clip = 3.0
     cfg.num_workers = 2
     cfg.num_envs_per_worker = 1
     obs_space = spaces.Dict({
-        "obs": spaces.Box(-1.0, 1.0, (198,), dtype=np.float32),
-        "replay_clock": spaces.Box(-1, 100, (7,), dtype=np.int64),
+        "obs": spaces.Box(-1.0, 1.0, (obs_dim,), dtype=np.float32),
+        "replay_clock": spaces.Box(-1, 100, (stride, 7), dtype=np.int64),
+        "replay_obs": spaces.Box(-np.inf, np.inf, (stride + 1, obs_dim), dtype=np.float32),
+        "replay_rewards": spaces.Box(-np.inf, np.inf, (stride,), dtype=np.float32),
+        "replay_length": spaces.Box(0, stride, (), dtype=np.int64),
     })
-    action_space = spaces.Box(-1.0, 1.0, (344,), dtype=np.float32)
+    action_space = spaces.Box(-1.0, 1.0, (horizon * action_dim,), dtype=np.float32)
     env_info = SimpleNamespace(obs_space=obs_space, action_space=action_space)
     versions = torch.zeros(1, dtype=torch.int64)
     learner = FastTD3Learner(cfg, env_info, versions, 0, ParameterServer(0, versions, True))
@@ -603,13 +658,18 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     monkeypatch.setattr(learner, "_should_save_summaries", lambda: True)
 
     def train_frame(target, frame):
-        clock = torch.tensor([0, frame, -1, -1, 0, -1, -1]).expand(2, 2, -1).clone()
-        next_clock = torch.tensor([0, frame + 1, frame, 0, 1, 0, 1]).expand(2, 1, -1).clone()
+        clock = torch.tensor([
+            [0, frame * stride + index, frame * stride, index, index == 0, 0, stride]
+            for index in range(stride)
+        ]).expand(2, 1, stride, 7).clone()
+        raw_obs = (torch.arange(stride + 1).float() * 0.01 + frame * 0.1).reshape(1, 1, stride + 1, 1).expand(2, 1, stride + 1, obs_dim)
         return target.train({
-            "obs": {"obs": torch.full((2, 2, 198), frame * 0.1), "replay_clock": clock},
-            "next_obs": {"obs": torch.full((2, 1, 198), (frame + 1) * 0.1), "replay_clock": next_clock},
-            "actions": torch.zeros(2, 1, 344),
-            "rewards": torch.ones(2, 1),
+            "obs": {"obs": torch.full((2, 2, obs_dim), frame * 0.1)},
+            "next_obs": {"obs": torch.full((2, 1, obs_dim), (frame + 1) * 0.1), "replay_clock": clock,
+                         "replay_obs": raw_obs, "replay_rewards": torch.arange(1, stride + 1).float().expand(2, 1, stride),
+                         "replay_length": torch.full((2, 1), stride)},
+            "actions": torch.zeros(2, 1, horizon * action_dim),
+            "rewards": torch.full((2, 1), 999.),
             "dones": torch.zeros(2, 1, dtype=torch.bool),
             "time_outs": torch.zeros(2, 1, dtype=torch.bool),
             "env_ids": torch.arange(2).reshape(2, 1),
@@ -620,21 +680,24 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     assert learner.train_step == 4
     assert all(np.isfinite(value) for value in report[TRAIN_STATS].values())
     assert report[TRAIN_STATS]["actor_action_l2"] > 0
-    physical = torch.zeros(2, 198, device=learner.device)
-    assert learner.actor_critic.actor(physical).shape == (2, 344)
-    assert learner.replay.storage["critic_obs"].shape == (16, 206)
-    counts = torch.tensor([[1.0, 0, 0, 0, 0, 0, 0, 0]], device=learner.device).expand(6, -1)
-    torch.testing.assert_close(learner.replay.storage["critic_obs"][:6, 198:], counts)
+    physical = torch.zeros(2, obs_dim, device=learner.device)
+    assert learner.actor_critic.actor(physical).shape == (2, horizon * action_dim)
+    assert learner.replay.storage["critic_obs"].shape == (16, obs_dim + horizon)
+    counts = torch.cat((torch.ones(stride), torch.zeros(horizon - stride))).to(learner.device).expand(6, -1)
+    torch.testing.assert_close(learner.replay.storage["critic_obs"][:6, obs_dim:], counts)
     assert {state["step"].item() for state in learner.critic_optimizer.state.values()} == {4}
     assert {state["step"].item() for state in learner.actor_optimizer.state.values()} == {2}
 
+    expected_reward = sum(cfg.gamma ** index * min(2.0 * (index + 1), 3.0) for index in range(stride))
+    torch.testing.assert_close(learner.replay.storage["rewards"][:6], torch.full((6,), expected_reward, device=learner.device))
+    torch.testing.assert_close(learner.replay.storage["discount"][:6], torch.full((6,), cfg.gamma ** stride, device=learner.device))
     checkpoint = deepcopy(learner._get_checkpoint_dict())
     cfg.restart_behavior = "resume"
     cfg.initial_model_path = str(tmp_path / "unused_teacher.pth")
     resumed = FastTD3Learner(cfg, env_info, versions, 0, ParameterServer(0, versions, True))
     monkeypatch.setattr(resumed, "load_from_checkpoint", lambda policy_id: resumed._load_state(checkpoint))
     resumed.init()
-    assert (resumed.train_step, resumed.env_steps, len(resumed.replay), resumed.update_credit) == (4, 8, 0, 0)
+    assert (resumed.train_step, resumed.env_steps, len(resumed.replay), resumed.update_credit) == (4, 8 * stride, 0, 0)
     torch.testing.assert_close(resumed.actor_critic.state_dict(), checkpoint["model"])
     torch.testing.assert_close(resumed.critic.state_dict(), checkpoint["critic"])
     torch.testing.assert_close(resumed.target_critic.state_dict(), checkpoint["target_critic"])

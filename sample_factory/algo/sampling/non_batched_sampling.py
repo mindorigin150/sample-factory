@@ -196,7 +196,7 @@ class ActorState:
 
         self.curr_traj_buffer["rewards"][rollout_step] = float(reward)
         self.curr_traj_buffer["dones"][rollout_step] = done
-        self.curr_traj_buffer["time_outs"][rollout_step] = truncated
+        self.curr_traj_buffer["time_outs"][rollout_step] = truncated and (self.cfg.algo != "FAST_TD3" or not terminated)
 
         # -1 policy_id does not match any valid policy on the learner, therefore this will be treated as
         # invalid data coming from a different policy and should be ignored by the learner.

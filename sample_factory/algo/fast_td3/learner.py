@@ -34,7 +34,7 @@ WEIGHT_DECAY = 0.1
 
 
 class FastTD3Learner(Learner):
-    """FastTD3 learner; H8 replay stitches issue decisions to their execution segments."""
+    """FastTD3 learner; chunk replay stitches issue decisions to their execution segments."""
 
     def __init__(
         self,
@@ -159,7 +159,7 @@ class FastTD3Learner(Learner):
         return obs.reshape(obs.shape[0], -1)
 
     def _chunk_critic_actions(self, actions, critic_obs):
-        mask = (critic_obs[:, 198:] > 0).repeat_interleave(
+        mask = (critic_obs[:, -self.action_chunk_horizon:] > 0).repeat_interleave(
             actions.shape[1] // self.action_chunk_horizon, dim=1
         )
         return actions * mask
@@ -242,12 +242,16 @@ class FastTD3Learner(Learner):
             critic_obs = critic_next_obs = None
             if self.action_chunk_horizon > 1:
                 critic_obs = torch.cat((
-                    self.actor_critic.empirical_obs_normalizer(batch["critic_obs"][:, :198], update_stats=False),
-                    batch["critic_obs"][:, 198:],
+                    self.actor_critic.empirical_obs_normalizer(
+                        batch["critic_obs"][:, :-self.action_chunk_horizon], update_stats=False,
+                    ),
+                    batch["critic_obs"][:, -self.action_chunk_horizon:],
                 ), dim=1)
                 critic_next_obs = torch.cat((
-                    self.actor_critic.empirical_obs_normalizer(batch["critic_next_obs"][:, :198], update_stats=False),
-                    batch["critic_next_obs"][:, 198:],
+                    self.actor_critic.empirical_obs_normalizer(
+                        batch["critic_next_obs"][:, :-self.action_chunk_horizon], update_stats=False,
+                    ),
+                    batch["critic_next_obs"][:, -self.action_chunk_horizon:],
                 ), dim=1)
         actions = batch["actions"]
         rewards = batch["rewards"]
@@ -293,7 +297,7 @@ class FastTD3Learner(Learner):
         }
         if self.action_chunk_horizon > 1:
             active = batch["execution_counts"].bool()
-            stats["actor_credit_fraction"] = (batch["critic_obs"][:, 198:] > 0).float().mean()
+            stats["actor_credit_fraction"] = (batch["critic_obs"][:, -self.action_chunk_horizon:] > 0).float().mean()
             stats["execution_length_mean"] = batch["execution_counts"].sum(dim=1).mean()
             for index in range(self.action_chunk_horizon):
                 stats[f"execution_index_{index}_fraction"] = active[:, index].float().mean()
@@ -313,19 +317,23 @@ class FastTD3Learner(Learner):
             with torch.no_grad(), self.param_server.policy_lock:
                 self.actor_critic.empirical_obs_normalizer(observations.to(self.device))
             if self.action_chunk_horizon > 1:
-                clock = batch["obs"]["replay_clock"][:, :-1].flatten(0, 1)
-                next_clock = batch["next_obs"]["replay_clock"].flatten(0, 1)
+                trace = batch["next_obs"]
+                raw_rewards = trace["replay_rewards"].flatten(0, 1).float() * self.cfg.reward_scale
+                raw_rewards = raw_rewards.clamp(-self.cfg.reward_clip, self.cfg.reward_clip)
+                lengths = trace["replay_length"].flatten()
                 self.replay.add_batch(
-                    observations, actions, rewards, next_observations, dones, timeouts,
-                    env_ids=batch["env_ids"].flatten(), frames=clock[:, 1], episodes=clock[:, 0],
-                    applied_sources=next_clock[:, 2], applied_indices=next_clock[:, 3],
-                    applied_windows=next_clock[:, 5:7], admitted=next_clock[:, 4].bool(),
+                    observations, actions, dones, timeouts,
+                    env_ids=batch["env_ids"].flatten(),
+                    raw_obs=trace["replay_obs"].flatten(0, 1).float(), rewards=raw_rewards,
+                    clock=trace["replay_clock"].flatten(0, 1), lengths=lengths,
                 )
+                advanced_frames = lengths.sum().item()
             else:
                 self.replay.add_batch(observations, actions, rewards, next_observations, dones, timeouts)
-        self.env_steps += rewards.shape[0]
+                advanced_frames = rewards.shape[0]
+        self.env_steps += advanced_frames
         if previous_replay_size >= LEARNING_START_TRANSITIONS:
-            self.update_credit += rewards.shape[0]
+            self.update_credit += advanced_frames
 
         stats = {}
         while (
