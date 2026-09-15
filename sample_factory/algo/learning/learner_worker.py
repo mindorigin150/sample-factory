@@ -15,7 +15,7 @@ from sample_factory.algo.learning.learner import Learner
 from sample_factory.algo.utils.context import SampleFactoryContext, set_global_context
 from sample_factory.algo.utils.env_info import EnvInfo
 from sample_factory.algo.utils.heartbeat import HeartbeatStoppableEventLoopObject
-from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, POLICY_ID_KEY
+from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, LEARNER_TRAIN_STEPS, POLICY_ID_KEY
 from sample_factory.algo.utils.model_sharing import ParameterServer
 from sample_factory.algo.utils.shared_buffers import BufferMgr
 from sample_factory.algo.utils.torch_utils import init_torch_runtime
@@ -143,7 +143,11 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
         self.model_initialized.emit(init_model_data)
 
         # runner should know the number of env steps in case we resume from a checkpoint
-        self.report_msg.emit({LEARNER_ENV_STEPS: self.learner.env_steps, POLICY_ID_KEY: self.learner.policy_id})
+        self.report_msg.emit({
+            LEARNER_ENV_STEPS: self.learner.env_steps,
+            LEARNER_TRAIN_STEPS: self.learner.train_step,
+            POLICY_ID_KEY: self.learner.policy_id,
+        })
 
         self.initialized.emit()
         log.debug(f"{self.object_id} finished initialization!")
@@ -153,9 +157,9 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         self.training_iteration_since_resume += 1
         self.training_batch_released.emit(batch_idx, self.training_iteration_since_resume)
-        self.finished_training_iteration.emit(self.training_iteration_since_resume)
         if stats is not None:
             self.report_msg.emit(stats)
+        self.finished_training_iteration.emit(self.training_iteration_since_resume)
 
     # noinspection PyMethodMayBeStatic
     def _cleanup_cache(self):

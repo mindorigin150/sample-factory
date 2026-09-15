@@ -160,6 +160,7 @@ def add_rl_args(p: ArgumentParser):
     p.add_argument("--fasttd3_replay_batch_size", default=32_768, type=int)
     p.add_argument("--fasttd3_action_chunk_horizon", default=1, type=int)
     p.add_argument("--fasttd3_transitions_per_update", default=64, type=int)
+    p.add_argument("--fasttd3_train_for_optimizer_steps", default=int(1e10), type=int)
     p.add_argument("--fasttd3_v_min", default=-250.0, type=float)
     p.add_argument("--fasttd3_v_max", default=250.0, type=float)
     p.add_argument("--fasttd3_actor_action_l2", default=0.0, type=float)

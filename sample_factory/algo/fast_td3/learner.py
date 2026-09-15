@@ -16,7 +16,13 @@ from sample_factory.algo.fast_td3.models import (
 from sample_factory.algo.fast_td3.replay import ChunkExecutionReplayBuffer, FlatReplayBuffer
 from sample_factory.algo.learning.learner import Learner, model_initialization_data
 from sample_factory.algo.utils.env_info import EnvInfo
-from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, POLICY_ID_KEY, STATS_KEY, TRAIN_STATS
+from sample_factory.algo.utils.misc import (
+    LEARNER_ENV_STEPS,
+    LEARNER_TRAIN_STEPS,
+    POLICY_ID_KEY,
+    STATS_KEY,
+    TRAIN_STATS,
+)
 from sample_factory.algo.utils.model_sharing import ParameterServer
 from sample_factory.algo.utils.shared_buffers import policy_device
 from sample_factory.algo.utils.tensor_dict import TensorDict
@@ -321,7 +327,7 @@ class FastTD3Learner(Learner):
                 raw_rewards = trace["replay_rewards"].flatten(0, 1).float() * self.cfg.reward_scale
                 raw_rewards = raw_rewards.clamp(-self.cfg.reward_clip, self.cfg.reward_clip)
                 lengths = trace["replay_length"].flatten()
-                self.replay.add_batch(
+                added_transitions = self.replay.add_batch(
                     observations, actions, dones, timeouts,
                     env_ids=batch["env_ids"].flatten(),
                     raw_obs=trace["replay_obs"].flatten(0, 1).float(), rewards=raw_rewards,
@@ -330,14 +336,15 @@ class FastTD3Learner(Learner):
                 advanced_frames = lengths.sum().item()
             else:
                 self.replay.add_batch(observations, actions, rewards, next_observations, dones, timeouts)
-                advanced_frames = rewards.shape[0]
+                added_transitions = advanced_frames = rewards.shape[0]
         self.env_steps += advanced_frames
         if previous_replay_size >= LEARNING_START_TRANSITIONS:
-            self.update_credit += advanced_frames
+            self.update_credit += added_transitions
 
         stats = {}
         while (
             self.update_credit >= self.cfg.fasttd3_transitions_per_update
+            and self.train_step < self.cfg.fasttd3_train_for_optimizer_steps
             and (len(self.replay) > 0 if self.action_chunk_horizon > 1 else len(self.replay) >= LEARNING_START_TRANSITIONS)
         ):
             with self.timing.add_time("replay_sample"):
@@ -351,6 +358,7 @@ class FastTD3Learner(Learner):
             self.param_server.update_weights(self.env_steps)
         report = {
             LEARNER_ENV_STEPS: self.env_steps,
+            LEARNER_TRAIN_STEPS: self.train_step,
             POLICY_ID_KEY: self.policy_id,
             STATS_KEY: {"replay": len(self.replay), "update_credit": self.update_credit},
         }
@@ -359,7 +367,12 @@ class FastTD3Learner(Learner):
                                    timeout_censored_segments=self.replay.censored_segments)
         if stats and self._should_save_summaries():
             self.last_summary_time = time.time()
-            report[TRAIN_STATS] = {name: value.item() for name, value in stats.items()}
+            report[TRAIN_STATS] = {
+                **{name: value.item() for name, value in stats.items()},
+                "raw_frames": self.env_steps,
+                "replay_size": len(self.replay),
+                "update_credit": self.update_credit,
+            }
         return report
 
     def _get_checkpoint_dict(self):

@@ -9,6 +9,7 @@ EPS = 1e-8
 # stats dictionary keys
 EPISODIC = "episodic"
 LEARNER_ENV_STEPS = "learner_env_steps"
+LEARNER_TRAIN_STEPS = "learner_train_steps"
 TRAIN_STATS = "train"
 TIMING_STATS = "timing"
 STATS_KEY = "stats"

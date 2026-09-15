@@ -10,8 +10,9 @@ from sample_factory.algo.fast_td3.learner import FastTD3Learner
 from sample_factory.algo.fast_td3.models import Critic, EmpiricalNormalization, FastTD3ActorCritic
 from sample_factory.algo.fast_td3.replay import ChunkExecutionReplayBuffer, FlatReplayBuffer
 from sample_factory.algo.fast_td3.sonic import SonicCudaDecoder
+from sample_factory.algo.runners.runner import Runner
 from sample_factory.algo.sampling.non_batched_sampling import ActorState
-from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, TRAIN_STATS
+from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, LEARNER_TRAIN_STEPS, TRAIN_STATS
 from sample_factory.algo.utils.model_sharing import ParameterClientAsync, ParameterServer
 from sample_factory.algo.utils.shared_buffers import alloc_policy_output_tensors
 from sample_factory.cfg.arguments import default_cfg, verify_cfg
@@ -267,6 +268,26 @@ def test_unsupported_fast_td3_options_are_rejected(unsupported_option):
     assert not verify_cfg(cfg, SimpleNamespace(num_agents=1))
 
 
+def test_fasttd3_runner_stops_on_optimizer_steps_and_uses_them_for_summaries():
+    runner = SimpleNamespace(
+        cfg=SimpleNamespace(
+            algo="FAST_TD3",
+            train_for_env_steps=int(1e10),
+            train_for_seconds=int(1e10),
+            fasttd3_train_for_optimizer_steps=500_000,
+        ),
+        env_steps={0: 160_000_000},
+        train_steps={0: 499_999},
+        total_train_seconds=1.0,
+    )
+
+    assert Runner._summary_step(runner, 0) == 499_999
+    assert not Runner._should_end_training(runner)
+
+    runner.train_steps[0] = 500_000
+    assert Runner._should_end_training(runner)
+
+
 def test_learner_warms_replay_without_update_debt(monkeypatch):
     monkeypatch.setattr("sample_factory.algo.fast_td3.learner.LEARNING_START_TRANSITIONS", 4)
     cfg = default_cfg("FAST_TD3", "fasttd3")
@@ -300,6 +321,7 @@ def test_learner_warms_replay_without_update_debt(monkeypatch):
     assert learner.env_steps == 4
     assert learner.train_step == 0
     assert first_report[LEARNER_ENV_STEPS] == learner.env_steps
+    assert first_report[LEARNER_TRAIN_STEPS] == learner.train_step
     assert versions[0].item() == learner.env_steps
 
     normalizer_count = learner.actor_critic.empirical_obs_normalizer.count.item()
@@ -346,7 +368,13 @@ def test_learner_warms_replay_without_update_debt(monkeypatch):
 
     monkeypatch.setattr(learner, "_should_save_summaries", lambda: True)
     train_stats = learner.train(batch)[TRAIN_STATS]
-    assert {"actor_loss", "actor_q_loss", "actor_action_l2"} <= train_stats.keys()
+    assert {
+        "actor_loss", "actor_q_loss", "actor_action_l2",
+        "raw_frames", "replay_size", "update_credit",
+    } <= train_stats.keys()
+    cfg.fasttd3_train_for_optimizer_steps = learner.train_step
+    learner.train(batch)
+    assert learner.train_step == cfg.fasttd3_train_for_optimizer_steps
 
     async_cfg = default_cfg("FAST_TD3", "fasttd3")
     async_cfg.device = "cpu"
@@ -625,7 +653,7 @@ def test_chunk_q_and_actor_credit_use_the_planned_window(monkeypatch, coefficien
 ])
 @pytest.mark.parametrize("obs_dim,action_dim,stride,horizon", [(3, 1, 2, 4), (17, 6, 3, 8), (198, 43, 1, 8)])
 def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compiled, obs_dim, action_dim, stride, horizon):
-    """Long-lived learner contract: physical actor, planned critic, updates and cold replay resume."""
+    """Chunk updates depend on completed replay transitions, not raw trace stride."""
     monkeypatch.setattr("sample_factory.algo.fast_td3.learner.LEARNING_START_TRANSITIONS", 2)
     cfg = default_cfg("FAST_TD3", "chunk_resume")
     cfg.device = device
@@ -638,7 +666,7 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     cfg.fasttd3_action_chunk_horizon = horizon
     cfg.fasttd3_replay_capacity = 16
     cfg.fasttd3_replay_batch_size = 2
-    cfg.fasttd3_transitions_per_update = stride
+    cfg.fasttd3_transitions_per_update = 1
     cfg.reward_scale = 2.0
     cfg.reward_clip = 3.0
     cfg.num_workers = 2
@@ -678,6 +706,7 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     for frame in range(4):
         report = train_frame(learner, frame)
     assert learner.train_step == 4
+    assert report[LEARNER_TRAIN_STEPS] == learner.train_step
     assert all(np.isfinite(value) for value in report[TRAIN_STATS].values())
     assert report[TRAIN_STATS]["actor_action_l2"] > 0
     physical = torch.zeros(2, obs_dim, device=learner.device)

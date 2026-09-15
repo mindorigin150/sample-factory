@@ -20,6 +20,7 @@ from sample_factory.algo.utils.heartbeat import HeartbeatStoppableEventLoopObjec
 from sample_factory.algo.utils.misc import (
     EPISODIC,
     LEARNER_ENV_STEPS,
+    LEARNER_TRAIN_STEPS,
     SAMPLES_COLLECTED,
     STATS_KEY,
     TIMING_STATS,
@@ -104,6 +105,7 @@ class Runner(EventLoopObject, Configurable):
 
         # env_steps counts total number of simulation steps per policy (including frameskipped)
         self.env_steps: Dict[PolicyID, int] = dict()
+        self.train_steps: Dict[PolicyID, int] = dict()
 
         # samples_collected counts the total number of observations processed by the algorithm
         self.samples_collected = [0 for _ in range(self.cfg.num_policies)]
@@ -151,6 +153,7 @@ class Runner(EventLoopObject, Configurable):
         # handlers for policy-specific messages
         self.policy_msg_handlers: Dict[str, List[PolicyMsgHandler]] = {
             LEARNER_ENV_STEPS: [self._learner_steps_handler],
+            LEARNER_TRAIN_STEPS: [self._learner_train_steps_handler],
             EPISODIC: [self._episodic_stats_handler],
             TRAIN_STATS: [self._train_stats_handler],
             SAMPLES_COLLECTED: [self._samples_stats_handler],
@@ -277,6 +280,15 @@ class Runner(EventLoopObject, Configurable):
         runner.env_steps[policy_id] = env_steps
 
     @staticmethod
+    def _learner_train_steps_handler(runner: Runner, msg: Dict, policy_id: PolicyID) -> None:
+        runner.train_steps[policy_id] = msg[LEARNER_TRAIN_STEPS]
+
+    def _summary_step(self, policy_id: PolicyID) -> int:
+        if self.cfg.algo == "FAST_TD3":
+            return self.train_steps[policy_id]
+        return self.env_steps[policy_id]
+
+    @staticmethod
     def _episodic_stats_handler(runner: Runner, msg: Dict, policy_id: PolicyID) -> None:
         s = msg[EPISODIC]
         for _, key, value in iterate_recursively(s):
@@ -299,7 +311,7 @@ class Runner(EventLoopObject, Configurable):
         """We write the train summaries to disk right away instead of accumulating them."""
         train_stats = msg[TRAIN_STATS]
         for key, scalar in train_stats.items():
-            runner.writers[policy_id].add_scalar(f"train/{key}", scalar, runner.env_steps[policy_id])
+            runner.writers[policy_id].add_scalar(f"train/{key}", scalar, runner._summary_step(policy_id))
 
         for key in ["version_diff_min", "version_diff_max", "version_diff_avg"]:
             if key in train_stats:
@@ -395,20 +407,21 @@ class Runner(EventLoopObject, Configurable):
         default_policy = 0
         for policy_id, env_steps in self.env_steps.items():
             writer = self.writers[policy_id]
+            summary_step = self._summary_step(policy_id)
             if policy_id == default_policy:
                 if not math.isnan(fps):
-                    writer.add_scalar("perf/_fps", fps, env_steps)
+                    writer.add_scalar("perf/_fps", fps, summary_step)
 
-                writer.add_scalar("stats/master_process_memory_mb", float(memory_mb), env_steps)
+                writer.add_scalar("stats/master_process_memory_mb", float(memory_mb), summary_step)
                 for key, value in self.avg_stats.items():
                     if len(value) >= value.maxlen or (len(value) > 10 and self.total_train_seconds > 300):
-                        writer.add_scalar(f"stats/{key}", np.mean(value), env_steps)
+                        writer.add_scalar(f"stats/{key}", np.mean(value), summary_step)
 
                 for key, value in self.stats.items():
-                    writer.add_scalar(f"stats/{key}", value, env_steps)
+                    writer.add_scalar(f"stats/{key}", value, summary_step)
 
             if not math.isnan(sample_throughput[policy_id]):
-                writer.add_scalar("perf/_sample_throughput", sample_throughput[policy_id], env_steps)
+                writer.add_scalar("perf/_sample_throughput", sample_throughput[policy_id], summary_step)
 
             for key, stat in self.policy_avg_stats.items():
                 if len(stat[policy_id]) >= stat[policy_id].maxlen or (
@@ -431,12 +444,12 @@ class Runner(EventLoopObject, Configurable):
                         min_tag = f"policy_stats/avg_{key}_min"
                         max_tag = f"policy_stats/avg_{key}_max"
 
-                    writer.add_scalar(avg_tag, float(stat_value), env_steps)
+                    writer.add_scalar(avg_tag, float(stat_value), summary_step)
 
                     # for key stats report min/max as well
                     if key in ("reward", "true_objective", "len"):
-                        writer.add_scalar(min_tag, float(min(stat[policy_id])), env_steps)
-                        writer.add_scalar(max_tag, float(max(stat[policy_id])), env_steps)
+                        writer.add_scalar(min_tag, float(min(stat[policy_id])), summary_step)
+                        writer.add_scalar(max_tag, float(max(stat[policy_id])), summary_step)
 
             self._observers_call(AlgoObserver.extra_summaries, self, policy_id, writer, env_steps)
 
@@ -700,6 +713,10 @@ class Runner(EventLoopObject, Configurable):
 
     def _should_end_training(self):
         end = len(self.env_steps) > 0 and all(s > self.cfg.train_for_env_steps for s in self.env_steps.values())
+        if self.cfg.algo == "FAST_TD3":
+            end |= len(self.train_steps) > 0 and all(
+                s >= self.cfg.fasttd3_train_for_optimizer_steps for s in self.train_steps.values()
+            )
         end |= self.total_train_seconds > self.cfg.train_for_seconds
         return end
 
