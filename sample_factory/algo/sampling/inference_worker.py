@@ -134,7 +134,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
         self._prepare_policy_outputs_func: PrepareOutputsFunc = prepare_policy_outputs
 
         self.is_initialized = False
-        self.sonic_decoder = None
 
     @signal
     def initialized(self):
@@ -160,13 +159,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
                 return
 
         self.param_client.on_weights_initialized(state_dict, self.device, policy_version)
-
-        if self.cfg.fasttd3_sonic_decoder_path:
-            from sample_factory.algo.fast_td3.sonic import SonicCudaDecoder
-
-            self.sonic_decoder = SonicCudaDecoder(
-                self.cfg.fasttd3_sonic_decoder_path, self.device
-            )
 
         # we can create and connect Timers and EventLoopObjects here because they all interact within one loop
         self.inference_loop = TightLoop(self.event_loop)
@@ -345,21 +337,6 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
             with timing.add_time("forward"):
                 policy_outputs = actor_critic(normalized_obs, rnn_states)
-                if self.sonic_decoder is not None:
-                    # Keep the full policy action in the trajectory; only body actions
-                    # decoded from SONIC tokens are sent through env_actions.
-                    decoder_state = obs["sonic_state"].to(self.device).float()
-                    if "base_token" in obs:
-                        decoder_tokens = obs["base_token"].to(self.device).float()
-                    elif "reference_token" in obs:
-                        decoder_tokens = obs["reference_token"].to(self.device).float()
-                        decoder_tokens = decoder_tokens + 0.25 * policy_outputs["actions"][..., :64]
-                    else:
-                        decoder_tokens = policy_outputs["actions"][..., :64]
-                    policy_outputs["env_actions"] = self.sonic_decoder(
-                        decoder_tokens,
-                        decoder_state,
-                    )
                 policy_outputs["policy_version"] = torch.empty([num_samples]).fill_(self.param_client.policy_version)
 
             with timing.add_time("prepare_outputs"):
