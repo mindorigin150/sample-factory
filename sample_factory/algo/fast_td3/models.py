@@ -192,23 +192,10 @@ class FastTD3ActorCritic(ActorCritic):
 
     def __init__(self, obs_space, action_space, cfg):
         super().__init__(obs_space, action_space, cfg)
-        self.physical_obs_dim = math.prod(obs_space["obs"].shape)
-        self.observation_keys = (
-            ("obs", "scheduled_chunk", "scheduled_index")
-            if cfg.fasttd3_actor_chunk_context else ("obs",)
-        )
-        obs_dim = sum(math.prod(obs_space[key].shape) for key in self.observation_keys)
+        obs_dim = math.prod(obs_space["obs"].shape)
         action_dim = action_space.shape[0]
-        self.actor = Actor(self.physical_obs_dim, action_dim)
-        if cfg.fasttd3_actor_chunk_context:
-            with torch.random.fork_rng(devices=[]), torch.no_grad():
-                original = self.actor.net[0]
-                expanded = nn.Linear(obs_dim, original.out_features, device=original.weight.device)
-                expanded.weight[:, :self.physical_obs_dim].copy_(original.weight)
-                expanded.weight[:, self.physical_obs_dim:].zero_()
-                expanded.bias.copy_(original.bias)
-                self.actor.net[0] = expanded
-        self.empirical_obs_normalizer = EmpiricalNormalization(self.physical_obs_dim, torch.device("cpu"))
+        self.actor = Actor(obs_dim, action_dim)
+        self.empirical_obs_normalizer = EmpiricalNormalization(obs_dim, torch.device("cpu"))
         self.obs_normalizer = nn.Identity()
 
     def model_to_device(self, device):
@@ -220,18 +207,9 @@ class FastTD3ActorCritic(ActorCritic):
     def type_for_input_tensor(self, input_tensor_name: str) -> torch.dtype:
         return torch.float32
 
-    def observation_tensor(self, obs: Dict[str, Tensor]) -> Tensor:
-        return torch.cat(
-            [obs[key].float().flatten(start_dim=1) for key in self.observation_keys], dim=1
-        )
-
-    def normalize_observation_tensor(self, obs: Tensor, update_stats: bool = True) -> Tensor:
-        physical = self.empirical_obs_normalizer(obs[:, :self.physical_obs_dim], update_stats)
-        return torch.cat((physical, obs[:, self.physical_obs_dim:]), dim=1)
-
     def normalize_obs(self, obs: Dict[str, Tensor]) -> Dict[str, Tensor]:
         obs = dict(obs)
-        obs["obs"] = self.normalize_observation_tensor(self.observation_tensor(obs))
+        obs["obs"] = self.empirical_obs_normalizer(obs["obs"].float())
         return obs
 
     def summaries(self) -> Dict:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import time
-from copy import deepcopy
 from typing import Dict
 
 import torch
@@ -56,7 +55,6 @@ class FastTD3Learner(Learner):
         self.replay = None
         self.critic: Critic | None = None
         self.target_critic: Critic | None = None
-        self.target_actor = None
         self.actor_optimizer = None
         self.critic_optimizer = None
         self.update_credit = 0
@@ -73,9 +71,6 @@ class FastTD3Learner(Learner):
             self.env_info.obs_space, self.env_info.action_space, self.cfg
         ).to(self.device)
         self.actor_critic.train()
-        if self.cfg.fasttd3_target_actor:
-            self.target_actor = deepcopy(self.actor_critic.actor)
-            self.target_actor.requires_grad_(False)
 
         obs_dim = math.prod(self.env_info.obs_space["obs"].shape)
         action_dim = self.env_info.action_space.shape[0]
@@ -133,8 +128,6 @@ class FastTD3Learner(Learner):
             self.actor_critic.load_state_dict(checkpoint_dict["model"])
             self.critic.load_state_dict(checkpoint_dict["critic"])
             self.target_critic.load_state_dict(checkpoint_dict["target_critic"])
-            if self.cfg.fasttd3_target_actor:
-                self.target_actor.load_state_dict(self.actor_critic.actor.state_dict())
         self.update_credit = 0
 
         if self.cfg.fasttd3_compile:
@@ -159,8 +152,6 @@ class FastTD3Learner(Learner):
         self.actor_critic.load_state_dict(checkpoint_dict["model"])
         self.critic.load_state_dict(checkpoint_dict["critic"])
         self.target_critic.load_state_dict(checkpoint_dict["target_critic"])
-        if self.cfg.fasttd3_target_actor:
-            self.target_actor.load_state_dict(checkpoint_dict["target_actor"])
         self.actor_optimizer.load_state_dict(checkpoint_dict["actor_optimizer"])
         self.critic_optimizer.load_state_dict(checkpoint_dict["critic_optimizer"])
         if self.device.type != "cuda":
@@ -187,8 +178,7 @@ class FastTD3Learner(Learner):
             enabled=self.device.type == "cuda",
         ):
             with torch.no_grad():
-                target_actor = self.target_actor if self.cfg.fasttd3_target_actor else self.actor_critic.actor
-                target_actions = target_actor(next_obs)
+                target_actions = self.actor_critic.actor(next_obs)
                 target_noise = torch.randn_like(target_actions).mul(TARGET_POLICY_NOISE).clamp(
                     -TARGET_NOISE_CLIP, TARGET_NOISE_CLIP
                 )
@@ -253,8 +243,8 @@ class FastTD3Learner(Learner):
         obs = self._flatten_obs(batch["obs"])
         next_obs = self._flatten_obs(batch["next_obs"])
         with self.param_server.policy_lock:
-            obs = self.actor_critic.normalize_observation_tensor(obs)
-            next_obs = self.actor_critic.normalize_observation_tensor(next_obs)
+            obs = self.actor_critic.empirical_obs_normalizer(obs)
+            next_obs = self.actor_critic.empirical_obs_normalizer(next_obs)
             critic_obs = critic_next_obs = None
             if self.action_chunk_horizon > 1:
                 critic_obs = torch.cat((
@@ -296,12 +286,6 @@ class FastTD3Learner(Learner):
                 actor_action_l2 = actor_action_l2.clone()
             for parameter in self.critic.parameters():
                 parameter.requires_grad_(True)
-            if self.cfg.fasttd3_target_actor:
-                with torch.no_grad():
-                    target_parameters = [parameter.data for parameter in self.target_actor.parameters()]
-                    parameters = [parameter.data for parameter in self.actor_critic.actor.parameters()]
-                    torch._foreach_mul_(target_parameters, 1.0 - TAU)
-                    torch._foreach_add_(target_parameters, parameters, alpha=TAU)
 
         with torch.no_grad():
             target_parameters = [parameter.data for parameter in self.target_critic.parameters()]
@@ -327,14 +311,8 @@ class FastTD3Learner(Learner):
 
     def train(self, batch: TensorDict):
         self.actor_critic.train()
-        observations = self.actor_critic.observation_tensor({
-            key: batch["obs"][key][:, :-1].flatten(0, 1)
-            for key in self.actor_critic.observation_keys
-        })
-        next_observations = self.actor_critic.observation_tensor({
-            key: batch["next_obs"][key].flatten(0, 1)
-            for key in self.actor_critic.observation_keys
-        })
+        observations = batch["obs"]["obs"][:, :-1].flatten(0, 1).float()
+        next_observations = batch["next_obs"]["obs"].flatten(0, 1).float()
         actions = batch["actions"].flatten(0, 1).float()
         rewards = batch["rewards"].flatten().float()
         dones = batch["dones"].flatten().bool()
@@ -343,7 +321,7 @@ class FastTD3Learner(Learner):
         previous_replay_size = len(self.replay)
         with self.timing.add_time("replay_add"):
             with torch.no_grad(), self.param_server.policy_lock:
-                self.actor_critic.normalize_observation_tensor(observations.to(self.device))
+                self.actor_critic.empirical_obs_normalizer(observations.to(self.device))
             if self.action_chunk_horizon > 1:
                 trace = batch["next_obs"]
                 raw_rewards = trace["replay_rewards"].flatten(0, 1).float() * self.cfg.reward_scale
@@ -398,7 +376,7 @@ class FastTD3Learner(Learner):
         return report
 
     def _get_checkpoint_dict(self):
-        checkpoint = {
+        return {
             "train_step": self.train_step,
             "env_steps": self.env_steps,
             "best_performance": self.best_performance,
@@ -409,6 +387,3 @@ class FastTD3Learner(Learner):
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "curr_lr": self.curr_lr,
         }
-        if self.cfg.fasttd3_target_actor:
-            checkpoint["target_actor"] = self.target_actor.state_dict()
-        return checkpoint
