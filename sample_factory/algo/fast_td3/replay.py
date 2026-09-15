@@ -94,40 +94,32 @@ class ChunkExecutionReplayBuffer(FlatReplayBuffer):
             "actions": action,
             "critic_obs": critic_obs,
             "source": source,
-            "rewards": torch.zeros_like(reward),
-            "discount": torch.ones_like(reward),
-            "execution_counts": torch.zeros(
-                self.horizon, dtype=torch.float32, device=self.device
-            ),
+            "rewards": np.zeros_like(reward),
+            "discount": np.ones_like(reward),
+            "execution_counts": np.zeros(self.horizon, dtype=np.float32),
         }
-
-    def _completed_values(self, segment):
-        return tuple(segment[name].unsqueeze(0) for name in self._fields)
 
     def add_batch(self, obs, actions, dones, timeouts, *, env_ids, raw_obs, rewards, clock, lengths):
         """Consume request observations and valid rows of each padded raw trace.
 
         Clock rows encode episode, frame, source, head, admitted, plan begin/end.
         """
-        obs, actions, raw_obs, rewards, dones, timeouts = (
-            value.detach().to(self.device)
-            for value in (obs, actions, raw_obs, rewards, dones, timeouts)
+        obs, actions, raw_obs, rewards, dones, timeouts, env_ids, clock, lengths = (
+            value.detach().cpu().numpy()
+            for value in (obs, actions, raw_obs, rewards, dones, timeouts, env_ids, clock, lengths)
         )
-        env_ids_cpu = env_ids.detach().cpu().numpy()
-        clock_cpu = clock.detach().cpu().numpy()
-        lengths_cpu = lengths.detach().cpu().numpy()
         completed = []
 
-        for row, env in enumerate(env_ids_cpu):
-            for index in range(lengths_cpu[row]):
-                episode, frame, source, head, admitted, start, end = clock_cpu[row, index]
+        for row, env in enumerate(env_ids):
+            for index in range(lengths[row]):
+                episode, frame, source, head, admitted, start, end = clock[row, index]
                 if episode != self.episodes[env]:
                     self.issued[env].clear()
                     self.current[env] = None
                     self.episodes[env] = episode
 
                 if admitted:
-                    self.issued[env][frame] = (obs[row].clone(), actions[row].clone())
+                    self.issued[env][frame] = (obs[row].copy(), actions[row].copy())
 
                 if source >= 0:
                     current = self.current[env]
@@ -136,18 +128,17 @@ class ChunkExecutionReplayBuffer(FlatReplayBuffer):
                         for key in tuple(self.issued[env]):
                             if key <= source:
                                 del self.issued[env][key]
-                        planned_counts = torch.as_tensor(
-                            np.bincount(np.minimum(np.arange(start, end), self.horizon - 1), minlength=self.horizon),
-                            device=self.device, dtype=obs.dtype,
-                        )
-                        critic_obs = torch.cat((raw_obs[row, index], planned_counts))
+                        planned_counts = np.bincount(
+                            np.minimum(np.arange(start, end), self.horizon - 1), minlength=self.horizon
+                        ).astype(obs.dtype)
+                        critic_obs = np.concatenate((raw_obs[row, index], planned_counts))
                         new_segment = self._new_segment(actor_obs, action, critic_obs, source, rewards[row, index])
                         if current is not None:
                             current["next_obs"] = actor_obs
                             current["critic_next_obs"] = critic_obs
-                            current["dones"] = torch.zeros_like(dones[row])
-                            current["timeouts"] = torch.zeros_like(timeouts[row])
-                            completed.append(self._completed_values(current))
+                            current["dones"] = np.zeros_like(dones[row])
+                            current["timeouts"] = np.zeros_like(timeouts[row])
+                            completed.append(current)
                         self.current[env] = new_segment
                         current = new_segment
                         self.execution_events += 1
@@ -155,23 +146,26 @@ class ChunkExecutionReplayBuffer(FlatReplayBuffer):
                     current["rewards"] += current["discount"] * rewards[row, index]
                     current["discount"] *= self.gamma
 
-                if dones[row].item() and index == lengths_cpu[row] - 1:
+                if dones[row] and index == lengths[row] - 1:
                     current = self.current[env]
                     if current is not None:
-                        if timeouts[row].item():
+                        if timeouts[row]:
                             self.censored_segments += 1
                         else:
-                            terminal_obs = raw_obs[row, index + 1].clone()
+                            terminal_obs = raw_obs[row, index + 1].copy()
                             current["next_obs"] = terminal_obs
-                            current["critic_next_obs"] = torch.cat((
-                                terminal_obs, torch.zeros(self.horizon, device=self.device)
+                            current["critic_next_obs"] = np.concatenate((
+                                terminal_obs, np.zeros(self.horizon, dtype=terminal_obs.dtype)
                             ))
-                            current["dones"] = dones[row].clone()
-                            current["timeouts"] = timeouts[row].clone()
-                            completed.append(self._completed_values(current))
+                            current["dones"] = dones[row].copy()
+                            current["timeouts"] = timeouts[row].copy()
+                            completed.append(current)
                     self.issued[env].clear()
                     self.current[env] = None
 
         if completed:
-            self._add_values(tuple(torch.cat(fields, dim=0) for fields in zip(*completed)))
+            self._add_values(tuple(
+                torch.from_numpy(np.stack([segment[name] for segment in completed]))
+                for name in self._fields
+            ))
         return len(completed)
