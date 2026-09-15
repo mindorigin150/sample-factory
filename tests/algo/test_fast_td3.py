@@ -96,6 +96,42 @@ def test_actor_action_l2_is_weighted_and_reported(coefficient):
     torch.testing.assert_close(actor_loss, actor_q_loss + coefficient * actor_action_l2)
 
 
+def test_critic_bootstraps_from_target_actor(monkeypatch):
+    class ConstantActor(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value = value
+
+        def forward(self, obs):
+            return torch.full((obs.shape[0], 2), self.value)
+
+    learner = FastTD3Learner.__new__(FastTD3Learner)
+    learner.device = torch.device("cpu")
+    learner.action_chunk_horizon = 1
+    learner.cfg = SimpleNamespace(fasttd3_target_actor=True)
+    learner.actor_critic = SimpleNamespace(actor=ConstantActor(0.5))
+    learner.target_actor = ConstantActor(-0.5)
+    learner.critic = Critic(3, 2, num_atoms=3)
+    learner.target_critic = deepcopy(learner.critic)
+    learner.critic_optimizer = torch.optim.SGD(learner.critic.parameters(), lr=0.0)
+    target_actions = []
+    learner.target_critic.qnet1.register_forward_pre_hook(
+        lambda module, args: target_actions.append(args[1].detach().clone())
+    )
+    monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
+
+    learner._critic_step(
+        torch.zeros(1, 3),
+        torch.zeros(1, 3),
+        torch.zeros(1, 2),
+        torch.ones(1),
+        torch.ones(1),
+        torch.full((1,), 0.99),
+    )
+
+    torch.testing.assert_close(target_actions[-1], torch.full((1, 2), -0.5))
+
+
 @pytest.mark.parametrize(
     ("device", "compiled"),
     [
@@ -543,6 +579,22 @@ def test_chunk_replay_orders_frames_delivered_across_batches():
     torch.testing.assert_close(replay.storage["next_obs"][0], torch.tensor([1.0]))
 
 
+def test_chunk_terminal_zeroes_actor_context():
+    replay = ChunkExecutionReplayBuffer(4, torch.device("cpu"), None, num_envs=1, gamma=0.5, horizon=2)
+    replay.add_batch(
+        torch.tensor([[1.0, 2.0, 9.0, 9.0]]),
+        torch.zeros(1, 2),
+        torch.tensor([True]),
+        torch.tensor([False]),
+        env_ids=torch.tensor([0]),
+        raw_obs=torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]),
+        rewards=torch.ones(1, 1),
+        clock=torch.tensor([[[0, 0, 0, 0, 1, 0, 1]]]),
+        lengths=torch.tensor([1]),
+    )
+    torch.testing.assert_close(replay.storage["next_obs"][0], torch.tensor([3.0, 4.0, 0.0, 0.0]))
+
+
 @pytest.mark.parametrize("terminated,truncated", [(True, False), (False, True), (True, True)])
 def test_fasttd3_sampling_preserves_physical_terminal_precedence(terminated, truncated):
     """Long-lived sampling/replay contract: a physical terminal is never timeout-censored."""
@@ -575,7 +627,7 @@ def test_chunk_q_and_actor_credit_use_the_planned_window(monkeypatch, coefficien
     learner = FastTD3Learner.__new__(FastTD3Learner)
     learner.device = torch.device("cpu")
     learner.action_chunk_horizon = 8
-    learner.cfg = SimpleNamespace(fasttd3_actor_action_l2=coefficient)
+    learner.cfg = SimpleNamespace(fasttd3_actor_action_l2=coefficient, fasttd3_target_actor=False)
     planned = torch.zeros(8, dtype=torch.bool)
     planned[heads] = True
     planned = planned.repeat_interleave(2)
@@ -629,6 +681,8 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     cfg.normalize_input = False
     cfg.fasttd3_compile = compiled
     cfg.fasttd3_action_chunk_horizon = horizon
+    cfg.fasttd3_target_actor = True
+    cfg.fasttd3_actor_chunk_context = True
     cfg.fasttd3_replay_capacity = 16
     cfg.fasttd3_replay_batch_size = 2
     cfg.fasttd3_transitions_per_update = 1
@@ -638,6 +692,8 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     cfg.num_envs_per_worker = 1
     obs_space = spaces.Dict({
         "obs": spaces.Box(-1.0, 1.0, (obs_dim,), dtype=np.float32),
+        "scheduled_chunk": spaces.Box(-1.0, 1.0, (horizon, action_dim), dtype=np.float32),
+        "scheduled_index": spaces.Box(0.0, 1.0, (horizon,), dtype=np.float32),
         "replay_clock": spaces.Box(-1, 100, (stride, 7), dtype=np.int64),
         "replay_obs": spaces.Box(-np.inf, np.inf, (stride + 1, obs_dim), dtype=np.float32),
         "replay_rewards": spaces.Box(-np.inf, np.inf, (stride,), dtype=np.float32),
@@ -657,8 +713,14 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
         ]).expand(2, 1, stride, 7).clone()
         raw_obs = (torch.arange(stride + 1).float() * 0.01 + frame * 0.1).reshape(1, 1, stride + 1, 1).expand(2, 1, stride + 1, obs_dim)
         return target.train({
-            "obs": {"obs": torch.full((2, 2, obs_dim), frame * 0.1)},
+            "obs": {
+                "obs": torch.full((2, 2, obs_dim), frame * 0.1),
+                "scheduled_chunk": torch.zeros(2, 2, horizon, action_dim),
+                "scheduled_index": torch.zeros(2, 2, horizon),
+            },
             "next_obs": {"obs": torch.full((2, 1, obs_dim), (frame + 1) * 0.1), "replay_clock": clock,
+                         "scheduled_chunk": torch.zeros(2, 1, horizon, action_dim),
+                         "scheduled_index": torch.zeros(2, 1, horizon),
                          "replay_obs": raw_obs, "replay_rewards": torch.arange(1, stride + 1).float().expand(2, 1, stride),
                          "replay_length": torch.full((2, 1), stride)},
             "actions": torch.zeros(2, 1, horizon * action_dim),
@@ -674,8 +736,10 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     assert report[LEARNER_TRAIN_STEPS] == learner.train_step
     assert all(np.isfinite(value) for value in report[TRAIN_STATS].values())
     assert report[TRAIN_STATS]["actor_action_l2"] > 0
-    physical = torch.zeros(2, obs_dim, device=learner.device)
-    assert learner.actor_critic.actor(physical).shape == (2, horizon * action_dim)
+    actor_obs_dim = obs_dim + horizon * action_dim + horizon
+    actor_obs = torch.zeros(2, actor_obs_dim, device=learner.device)
+    assert learner.actor_critic.actor(actor_obs).shape == (2, horizon * action_dim)
+    assert learner.replay.storage["obs"].shape == (16, actor_obs_dim)
     assert learner.replay.storage["critic_obs"].shape == (16, obs_dim + horizon)
     counts = torch.cat((torch.ones(stride), torch.zeros(horizon - stride))).to(learner.device).expand(6, -1)
     torch.testing.assert_close(learner.replay.storage["critic_obs"][:6, obs_dim:], counts)
@@ -686,6 +750,10 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     torch.testing.assert_close(learner.replay.storage["rewards"][:6], torch.full((6,), expected_reward, device=learner.device))
     torch.testing.assert_close(learner.replay.storage["discount"][:6], torch.full((6,), cfg.gamma ** stride, device=learner.device))
     checkpoint = deepcopy(learner._get_checkpoint_dict())
+    assert any(
+        not torch.equal(actor, target)
+        for actor, target in zip(learner.actor_critic.actor.parameters(), learner.target_actor.parameters())
+    )
     cfg.restart_behavior = "resume"
     cfg.initial_model_path = str(tmp_path / "unused_teacher.pth")
     resumed = FastTD3Learner(cfg, env_info, versions, 0, ParameterServer(0, versions, True))
@@ -695,6 +763,7 @@ def test_chunk_learner_updates_and_resumes(monkeypatch, tmp_path, device, compil
     torch.testing.assert_close(resumed.actor_critic.state_dict(), checkpoint["model"])
     torch.testing.assert_close(resumed.critic.state_dict(), checkpoint["critic"])
     torch.testing.assert_close(resumed.target_critic.state_dict(), checkpoint["target_critic"])
+    torch.testing.assert_close(resumed.target_actor.state_dict(), checkpoint["target_actor"])
     torch.testing.assert_close(resumed.actor_optimizer.state_dict(), checkpoint["actor_optimizer"])
     torch.testing.assert_close(resumed.critic_optimizer.state_dict(), checkpoint["critic_optimizer"])
     train_frame(resumed, 4)

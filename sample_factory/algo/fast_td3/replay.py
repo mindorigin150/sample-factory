@@ -167,7 +167,9 @@ class ChunkExecutionReplayBuffer(FlatReplayBuffer):
                             self.censored_segments += 1
                         else:
                             terminal_obs = event["next_raw_obs"]
-                            current["next_obs"] = terminal_obs
+                            terminal_actor_obs = np.zeros_like(current["obs"])
+                            terminal_actor_obs[:terminal_obs.size] = terminal_obs.reshape(-1)
+                            current["next_obs"] = terminal_actor_obs
                             current["critic_next_obs"] = np.concatenate((
                                 terminal_obs, np.zeros(self.horizon, dtype=terminal_obs.dtype)
                             ))
