@@ -82,9 +82,11 @@ class ChunkExecutionReplayBuffer(FlatReplayBuffer):
         super().__init__(capacity, device, generator)
         self.gamma = gamma
         self.horizon = horizon
-        self.episodes = np.full(num_envs, -1, dtype=np.int64)
         self.issued = [dict() for _ in range(num_envs)]
         self.current = [None for _ in range(num_envs)]
+        self.pending = [dict() for _ in range(num_envs)]
+        self.next_episode = np.zeros(num_envs, dtype=np.int64)
+        self.next_frame = np.zeros(num_envs, dtype=np.int64)
         self.execution_events = 0
         self.censored_segments = 0
 
@@ -113,14 +115,25 @@ class ChunkExecutionReplayBuffer(FlatReplayBuffer):
         for row, env in enumerate(env_ids):
             for index in range(lengths[row]):
                 episode, frame, source, head, admitted, start, end = clock[row, index]
-                if episode != self.episodes[env]:
-                    self.issued[env].clear()
-                    self.current[env] = None
-                    self.episodes[env] = episode
+                self.pending[env][episode, frame] = {
+                    "issued": (obs[row].copy(), actions[row].copy()) if admitted else None,
+                    "source": source,
+                    "head": head,
+                    "start": start,
+                    "end": end,
+                    "raw_obs": raw_obs[row, index].copy(),
+                    "next_raw_obs": raw_obs[row, index + 1].copy(),
+                    "reward": rewards[row, index].copy(),
+                    "done": bool(dones[row] and index == lengths[row] - 1),
+                    "timeout": timeouts[row].copy(),
+                }
 
-                if admitted:
-                    self.issued[env][frame] = (obs[row].copy(), actions[row].copy())
+            while (self.next_episode[env], self.next_frame[env]) in self.pending[env]:
+                event = self.pending[env].pop((self.next_episode[env], self.next_frame[env]))
+                if event["issued"] is not None:
+                    self.issued[env][self.next_frame[env]] = event["issued"]
 
+                source = event["source"]
                 if source >= 0:
                     current = self.current[env]
                     if current is None or source != current["source"]:
@@ -129,10 +142,11 @@ class ChunkExecutionReplayBuffer(FlatReplayBuffer):
                             if key <= source:
                                 del self.issued[env][key]
                         planned_counts = np.bincount(
-                            np.minimum(np.arange(start, end), self.horizon - 1), minlength=self.horizon
+                            np.minimum(np.arange(event["start"], event["end"]), self.horizon - 1),
+                            minlength=self.horizon,
                         ).astype(obs.dtype)
-                        critic_obs = np.concatenate((raw_obs[row, index], planned_counts))
-                        new_segment = self._new_segment(actor_obs, action, critic_obs, source, rewards[row, index])
+                        critic_obs = np.concatenate((event["raw_obs"], planned_counts))
+                        new_segment = self._new_segment(actor_obs, action, critic_obs, source, event["reward"])
                         if current is not None:
                             current["next_obs"] = actor_obs
                             current["critic_next_obs"] = critic_obs
@@ -142,26 +156,30 @@ class ChunkExecutionReplayBuffer(FlatReplayBuffer):
                         self.current[env] = new_segment
                         current = new_segment
                         self.execution_events += 1
-                    current["execution_counts"][head] += 1.0
-                    current["rewards"] += current["discount"] * rewards[row, index]
+                    current["execution_counts"][event["head"]] += 1.0
+                    current["rewards"] += current["discount"] * event["reward"]
                     current["discount"] *= self.gamma
 
-                if dones[row] and index == lengths[row] - 1:
+                if event["done"]:
                     current = self.current[env]
                     if current is not None:
-                        if timeouts[row]:
+                        if event["timeout"]:
                             self.censored_segments += 1
                         else:
-                            terminal_obs = raw_obs[row, index + 1].copy()
+                            terminal_obs = event["next_raw_obs"]
                             current["next_obs"] = terminal_obs
                             current["critic_next_obs"] = np.concatenate((
                                 terminal_obs, np.zeros(self.horizon, dtype=terminal_obs.dtype)
                             ))
-                            current["dones"] = dones[row].copy()
-                            current["timeouts"] = timeouts[row].copy()
+                            current["dones"] = np.ones_like(dones[row])
+                            current["timeouts"] = event["timeout"]
                             completed.append(current)
                     self.issued[env].clear()
                     self.current[env] = None
+                    self.next_episode[env] += 1
+                    self.next_frame[env] = 0
+                else:
+                    self.next_frame[env] += 1
 
         if completed:
             self._add_values(tuple(

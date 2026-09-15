@@ -416,7 +416,7 @@ def test_chunk_execution_replay_credits_only_real_execution_windows(obs_dim):
         horizon=4,
     )
 
-    def add(frame, source, index, reward, *, done=False, timeout=False, buffer=replay, window=None):
+    def add(frame, source, index, reward, *, episode=0, done=False, timeout=False, buffer=replay, window=None):
         observation = torch.full((1, obs_dim), float(frame))
         action = torch.arange(8, dtype=torch.float32).reshape(1, 8) + frame * 10
         start, end = (index, index + 2) if window is None else window
@@ -424,7 +424,7 @@ def test_chunk_execution_replay_credits_only_real_execution_windows(obs_dim):
             observation, action, torch.tensor([done]), torch.tensor([timeout]),
             env_ids=torch.tensor([0]), raw_obs=torch.stack((observation, observation + 1), dim=1),
             rewards=torch.tensor([[reward]]), lengths=torch.tensor([1]),
-            clock=torch.tensor([[[0, frame, source, index, 1, start, end]]]),
+            clock=torch.tensor([[[episode, frame, source, index, 1, start, end]]]),
         )
 
     add(0, -1, -1, 0.0)
@@ -460,8 +460,8 @@ def test_chunk_execution_replay_credits_only_real_execution_windows(obs_dim):
     )
     assert add(0, 0, 0, 1.0, done=True, timeout=True, buffer=timeout_replay) == 0
     assert timeout_replay.censored_segments == 1
-    add(1, 1, 0, 2.0, buffer=timeout_replay)
-    assert add(2, 2, 0, 4.0, done=True, timeout=True, buffer=timeout_replay) == 1
+    add(0, 0, 0, 2.0, episode=1, buffer=timeout_replay)
+    assert add(1, 1, 0, 4.0, episode=1, done=True, timeout=True, buffer=timeout_replay) == 1
     assert len(timeout_replay) == 1
     assert timeout_replay.censored_segments == 2
     torch.testing.assert_close(timeout_replay.storage["rewards"][:1], torch.tensor([2.0]))
@@ -515,6 +515,32 @@ def test_chunk_replay_is_independent_of_raw_trace_grouping(stride, timeout):
     if not timeout:
         assert replay.storage["dones"][2]
         torch.testing.assert_close(replay.storage["critic_next_obs"][2, -4:], torch.zeros(4))
+
+
+def test_chunk_replay_orders_frames_delivered_across_batches():
+    replay = ChunkExecutionReplayBuffer(8, torch.device("cpu"), None, num_envs=1, gamma=0.5, horizon=4)
+
+    def add(frame, source):
+        observation = torch.tensor([[float(frame)]])
+        return replay.add_batch(
+            observation,
+            torch.tensor([[float(frame), float(frame)]]),
+            torch.tensor([False]),
+            torch.tensor([False]),
+            env_ids=torch.tensor([0]),
+            raw_obs=torch.tensor([[[float(frame)], [float(frame + 1)]]]),
+            rewards=torch.tensor([[1.0]]),
+            clock=torch.tensor([[[0, frame, source, 0 if source >= 0 else -1, 1, 0, 1]]]),
+            lengths=torch.tensor([1]),
+        )
+
+    assert add(1, 0) == 0
+    assert add(0, -1) == 0
+    assert replay.current[0]["source"] == 0
+    np.testing.assert_array_equal(replay.current[0]["obs"], np.array([0.0], dtype=np.float32))
+    assert add(2, 1) == 1
+    torch.testing.assert_close(replay.storage["obs"][0], torch.tensor([0.0]))
+    torch.testing.assert_close(replay.storage["next_obs"][0], torch.tensor([1.0]))
 
 
 @pytest.mark.parametrize("terminated,truncated", [(True, False), (False, True), (True, True)])

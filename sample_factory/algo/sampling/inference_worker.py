@@ -102,7 +102,9 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         if self.device.type != "cpu":
             # Keep accelerator inference requests batched while allowing a stuck worker to be bypassed.
-            min_num_requests = self.cfg.num_workers // (self.cfg.num_policies * self.cfg.policy_workers_per_policy)
+            min_num_requests = (self.cfg.num_workers * self.cfg.worker_num_splits) // (
+                self.cfg.num_policies * self.cfg.policy_workers_per_policy
+            )
             min_num_requests //= 3
             self.min_num_requests = max(1, min_num_requests)
             log.info(f"{self.object_id}: min accelerator requests: %d", self.min_num_requests)
