@@ -262,7 +262,10 @@ class Learner(Configurable):
     @staticmethod
     def get_checkpoints(checkpoints_dir, pattern="checkpoint_*"):
         checkpoints = glob.glob(join(checkpoints_dir, pattern))
-        return sorted(checkpoints)
+        # MC rounds can advance env_steps without an accepted actor update.
+        return sorted(checkpoints, key=lambda path: tuple(
+            int(part) for part in os.path.splitext(os.path.basename(path))[0].split("_")[1:3]
+        ))
 
     @staticmethod
     def load_checkpoint(checkpoints, device):

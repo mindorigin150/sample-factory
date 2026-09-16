@@ -5,6 +5,7 @@ from signal_slot.signal_slot import EventLoop, EventLoopProcess
 from sample_factory.algo.learning.learner_worker import init_learner_process
 from sample_factory.algo.runners.runner import Runner
 from sample_factory.algo.sampling.sampler import ParallelSampler
+from sample_factory.algo.mc_ppo.sampling import ParallelEpisodeSampler
 from sample_factory.algo.utils.context import sf_global_context
 from sample_factory.algo.utils.misc import ExperimentStatus
 from sample_factory.algo.utils.multiprocessing_utils import get_mp_ctx
@@ -40,7 +41,8 @@ class ParallelRunner(Runner):
             learner_proc.event_loop.owner = self.learners[policy_id]
             learner_proc.set_init_func_args((sf_global_context(), self.learners[policy_id]))
 
-        self.sampler = self._make_sampler(ParallelSampler, self.event_loop)
+        sampler_cls = ParallelEpisodeSampler if self.cfg.algo == "PPO" else ParallelSampler
+        self.sampler = self._make_sampler(sampler_cls, self.event_loop)
 
         self.connect_components()
         return status

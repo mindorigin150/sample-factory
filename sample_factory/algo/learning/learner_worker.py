@@ -11,6 +11,7 @@ from torch import Tensor
 
 from sample_factory.algo.learning.batcher import Batcher
 from sample_factory.algo.fast_td3.learner import FastTD3Learner
+from sample_factory.algo.mc_ppo.learner import MCPPOLearner
 from sample_factory.algo.learning.learner import Learner
 from sample_factory.algo.utils.context import SampleFactoryContext, set_global_context
 from sample_factory.algo.utils.env_info import EnvInfo
@@ -68,7 +69,7 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         policy_versions_tensor: Tensor = buffer_mgr.policy_versions
         self.param_server = ParameterServer(policy_id, policy_versions_tensor, cfg.serial_mode)
-        learner_cls = FastTD3Learner if cfg.algo == "FAST_TD3" else Learner
+        learner_cls = {"FAST_TD3": FastTD3Learner, "PPO": MCPPOLearner, "APPO": Learner}[cfg.algo]
         self.learner = learner_cls(cfg, env_info, policy_versions_tensor, policy_id, self.param_server)
 
         # total number of full training iterations (potentially multiple minibatches/epochs per iteration)
@@ -167,6 +168,8 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
     def on_stop(self, *args):
         self.learner.save()
+        if self.cfg.algo == "PPO":
+            self.learner.close()
         if not self.cfg.serial_mode:
             self.join_batcher_thread()
 

@@ -289,6 +289,11 @@ def default_make_actor_critic_func(cfg: Config, obs_space: ObsSpace, action_spac
 
 
 def create_actor_critic(cfg: Config, obs_space: ObsSpace, action_space: ActionSpace) -> ActorCritic:
+    if cfg.algo == "PPO":
+        # Algorithm modules derive from ActorCritic, so import after its definition.
+        from sample_factory.algo.mc_ppo.models import MCPPOActorCritic
+
+        return MCPPOActorCritic(obs_space, action_space, cfg)
     if cfg.algo == "FAST_TD3":
         # Local import breaks the model factory cycle: FastTD3ActorCritic extends ActorCritic.
         from sample_factory.algo.fast_td3.models import FastTD3ActorCritic

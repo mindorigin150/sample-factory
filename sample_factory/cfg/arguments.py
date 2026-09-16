@@ -156,7 +156,7 @@ def verify_cfg(cfg: Config, env_info: EnvInfo) -> bool:
     samples_per_training_iteration = cfg.num_batches_per_epoch * cfg.batch_size
     samples_from_all_workers_per_rollout = total_num_agents(cfg, env_info) * cfg.rollout // cfg.num_policies
 
-    if sync_rl:
+    if sync_rl and cfg.algo != "PPO":
         if (
             samples_per_training_iteration % samples_from_all_workers_per_rollout == 0
             and samples_per_training_iteration >= samples_from_all_workers_per_rollout

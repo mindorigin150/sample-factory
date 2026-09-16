@@ -661,6 +661,8 @@ class Runner(EventLoopObject, Configurable):
         self.event_loop.start.connect(self._on_start)
 
         sampler = self.sampler
+        if self.cfg.algo == "PPO" and self.cfg.ppo_start_round > self.cfg.ppo["rounds"]:
+            sampler.initialized.connect(self._stop_training)
         for policy_id in range(self.cfg.num_policies):
             # when runner is ready we initialize the learner first and then all other components in a chain
             learner_worker = self.learners[policy_id]
@@ -723,7 +725,10 @@ class Runner(EventLoopObject, Configurable):
     def _after_training_iteration(self, training_iteration_since_resume: int):
         self._observers_call(AlgoObserver.on_training_step, self, training_iteration_since_resume)
 
-        if self._should_end_training():
+        mc_complete = self.cfg.algo == "PPO" and (
+            self.cfg.ppo_start_round + training_iteration_since_resume > self.cfg.ppo["rounds"]
+        )
+        if mc_complete or self._should_end_training():
             self._stop_training()
 
     def _stop_training(self, failed: bool = False) -> None:

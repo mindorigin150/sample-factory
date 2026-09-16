@@ -107,6 +107,9 @@ class InferenceWorker(HeartbeatStoppableEventLoopObject, Configurable):
             )
             min_num_requests //= 3
             self.min_num_requests = max(1, min_num_requests)
+            if self.cfg.algo == "PPO":
+                # MC models pad the GEMM themselves; waiting penalizes the episode tail.
+                self.min_num_requests = 1
             log.info(f"{self.object_id}: min accelerator requests: %d", self.min_num_requests)
 
         self.requests = []
