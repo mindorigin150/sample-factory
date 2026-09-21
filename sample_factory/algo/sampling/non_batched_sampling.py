@@ -487,7 +487,11 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
                         )
                     policy_outputs_dict = dict()
                     for tensor_idx, name in enumerate(actor_state.policy_output_names):
-                        policy_outputs_dict[name] = policy_outputs[tensor_idx]
+                        policy_output = policy_outputs[tensor_idx]
+                        if name != "new_rnn_states":
+                            destination = actor_state.curr_traj_buffer[name][self.rollout_step]
+                            policy_output = policy_output.reshape(destination.shape)
+                        policy_outputs_dict[name] = policy_output
 
                     # save parsed trajectory outputs directly into the trajectory buffer
                     actor_state.set_trajectory_data(policy_outputs_dict, self.rollout_step)
