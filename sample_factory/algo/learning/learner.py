@@ -647,6 +647,8 @@ class Learner(Configurable):
                 targets = mb.returns
 
             adv_std, adv_mean = torch.std_mean(masked_select(adv, valids, num_invalids))
+            adv_min = adv.min()
+            adv_max = adv.max()
             adv = (adv - adv_mean) / torch.clamp_min(adv_std, 1e-7)  # normalize advantage
 
         with self.timing.add_time("losses"):
@@ -665,6 +667,8 @@ class Learner(Configurable):
             clip_ratio_high=clip_ratio_high,
             values=result["values"],
             adv=adv,
+            adv_min=adv_min,
+            adv_max=adv_max,
             adv_std=adv_std,
             adv_mean=adv_mean,
         )
@@ -873,11 +877,10 @@ class Learner(Configurable):
         stats.act_min = var.mb.actions.min()
         stats.act_max = var.mb.actions.max()
 
-        if "adv_mean" in stats:
-            stats.adv_min = var.mb.advantages.min()
-            stats.adv_max = var.mb.advantages.max()
-            stats.adv_std = var.adv_std
-            stats.adv_mean = var.adv_mean
+        stats.adv_min = var.adv_min
+        stats.adv_max = var.adv_max
+        stats.adv_std = var.adv_std
+        stats.adv_mean = var.adv_mean
 
         stats.max_abs_logprob = torch.abs(var.mb.action_logits).max()
 
