@@ -150,6 +150,7 @@ class Batcher(HeartbeatStoppableEventLoopObject):
                 rnn_size,
                 device,
                 False,
+                self.cfg.algo,
             )
             self.training_batches.append(training_batch)
 

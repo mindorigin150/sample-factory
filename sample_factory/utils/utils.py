@@ -266,10 +266,16 @@ def kill(proc_pid):
 
 def join_or_kill(process, timeout=1.0):
     process.join(timeout)
+    if not process.is_alive():
+        return
+    log.warning("Process %r could not join, terminate it!", process)
+    process.terminate()
+    process.join(timeout)
     if process.is_alive():
-        log.warning("Process %r could not join, kill it with fire!", process)
+        log.warning("Process %r survived terminate, kill it!", process)
         process.kill()
-        log.warning("Process %r is dead (%r)", process, process.is_alive())
+        process.join(timeout)
+    log.warning("Process %r is dead (%r)", process, process.is_alive())
 
 
 def list_child_processes():

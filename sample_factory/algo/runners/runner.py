@@ -21,6 +21,7 @@ from sample_factory.algo.utils.heartbeat import HeartbeatStoppableEventLoopObjec
 from sample_factory.algo.utils.misc import (
     EPISODIC,
     LEARNER_ENV_STEPS,
+    LEARNER_TRAIN_STEPS,
     SAMPLES_COLLECTED,
     STATS_KEY,
     TIMING_STATS,
@@ -47,6 +48,8 @@ from sample_factory.utils.utils import (
     summaries_dir,
 )
 from sample_factory.utils.wandb_utils import init_wandb
+
+SHUTDOWN_DRAIN_TIMEOUT_SEC = 10.0
 
 
 class AlgoObserver:
@@ -103,6 +106,7 @@ class Runner(EventLoopObject, Configurable):
 
         # env_steps counts total number of simulation steps per policy (including frameskipped)
         self.env_steps: Dict[PolicyID, int] = dict()
+        self.train_steps: Dict[PolicyID, int] = dict()
 
         # samples_collected counts the total number of observations processed by the algorithm
         self.samples_collected = [0 for _ in range(self.cfg.num_policies)]
@@ -150,6 +154,7 @@ class Runner(EventLoopObject, Configurable):
         # handlers for policy-specific messages
         self.policy_msg_handlers: Dict[str, List[PolicyMsgHandler]] = {
             LEARNER_ENV_STEPS: [self._learner_steps_handler],
+            LEARNER_TRAIN_STEPS: [self._learner_train_steps_handler],
             EPISODIC: [self._episodic_stats_handler],
             TRAIN_STATS: [self._train_stats_handler],
             SAMPLES_COLLECTED: [samples_stats_handler],
@@ -260,6 +265,15 @@ class Runner(EventLoopObject, Configurable):
         runner.env_steps[policy_id] = env_steps
 
     @staticmethod
+    def _learner_train_steps_handler(runner: Runner, msg: Dict, policy_id: PolicyID) -> None:
+        runner.train_steps[policy_id] = msg[LEARNER_TRAIN_STEPS]
+
+    def _summary_step(self, policy_id: PolicyID) -> int:
+        if self.cfg.algo == "FAST_TD3":
+            return self.train_steps[policy_id]
+        return self.env_steps[policy_id]
+
+    @staticmethod
     def _episodic_stats_handler(runner: Runner, msg: Dict, policy_id: PolicyID) -> None:
         s = msg[EPISODIC]
         for _, key, value in iterate_recursively(s):
@@ -282,7 +296,7 @@ class Runner(EventLoopObject, Configurable):
         """We write the train summaries to disk right away instead of accumulating them."""
         train_stats = msg[TRAIN_STATS]
         for key, scalar in train_stats.items():
-            runner.writers[policy_id].add_scalar(f"train/{key}", scalar, runner.env_steps[policy_id])
+            runner.writers[policy_id].add_scalar(f"train/{key}", scalar, runner._summary_step(policy_id))
 
         for key in ["version_diff_min", "version_diff_max", "version_diff_avg"]:
             if key in train_stats:
@@ -374,20 +388,21 @@ class Runner(EventLoopObject, Configurable):
         default_policy = 0
         for policy_id, env_steps in self.env_steps.items():
             writer = self.writers[policy_id]
+            summary_step = self._summary_step(policy_id)
             if policy_id == default_policy:
                 if not math.isnan(fps):
-                    writer.add_scalar("perf/_fps", fps, env_steps)
+                    writer.add_scalar("perf/_fps", fps, summary_step)
 
-                writer.add_scalar("stats/master_process_memory_mb", float(memory_mb), env_steps)
+                writer.add_scalar("stats/master_process_memory_mb", float(memory_mb), summary_step)
                 for key, value in self.avg_stats.items():
                     if len(value) >= value.maxlen or (len(value) > 10 and self.total_train_seconds > 300):
-                        writer.add_scalar(f"stats/{key}", np.mean(value), env_steps)
+                        writer.add_scalar(f"stats/{key}", np.mean(value), summary_step)
 
                 for key, value in self.stats.items():
-                    writer.add_scalar(f"stats/{key}", value, env_steps)
+                    writer.add_scalar(f"stats/{key}", value, summary_step)
 
             if not math.isnan(sample_throughput[policy_id]):
-                writer.add_scalar("perf/_sample_throughput", sample_throughput[policy_id], env_steps)
+                writer.add_scalar("perf/_sample_throughput", sample_throughput[policy_id], summary_step)
 
             for key, stat in self.policy_avg_stats.items():
                 if len(stat[policy_id]) >= stat[policy_id].maxlen or (
@@ -410,12 +425,12 @@ class Runner(EventLoopObject, Configurable):
                         min_tag = f"policy_stats/avg_{key}_min"
                         max_tag = f"policy_stats/avg_{key}_max"
 
-                    writer.add_scalar(avg_tag, float(stat_value), env_steps)
+                    writer.add_scalar(avg_tag, float(stat_value), summary_step)
 
                     # for key stats report min/max as well
                     if key in ("reward", "true_objective", "len"):
-                        writer.add_scalar(min_tag, float(min(stat[policy_id])), env_steps)
-                        writer.add_scalar(max_tag, float(max(stat[policy_id])), env_steps)
+                        writer.add_scalar(min_tag, float(min(stat[policy_id])), summary_step)
+                        writer.add_scalar(max_tag, float(max(stat[policy_id])), summary_step)
 
             self._observers_call(AlgoObserver.extra_summaries, self, policy_id, writer, env_steps)
 
@@ -627,6 +642,8 @@ class Runner(EventLoopObject, Configurable):
         self.event_loop.start.connect(self._on_start)
 
         sampler = self.sampler
+        if self.cfg.algo == "PPO" and self.cfg.ppo_start_round > self.cfg.ppo["rounds"]:
+            sampler.initialized.connect(self._stop_training)
         for policy_id in range(self.cfg.num_policies):
             # when runner is ready we initialize the learner first and then all other components in a chain
             learner_worker = self.learners[policy_id]
@@ -680,13 +697,20 @@ class Runner(EventLoopObject, Configurable):
     def _should_end_training(self):
         self.total_train_seconds = time.time() - self.start_time
         end = len(self.env_steps) > 0 and all(s > self.cfg.train_for_env_steps for s in self.env_steps.values())
+        if self.cfg.algo == "FAST_TD3":
+            end |= len(self.train_steps) > 0 and all(
+                s >= self.cfg.fasttd3_train_for_optimizer_steps for s in self.train_steps.values()
+            )
         end |= self.total_train_seconds > self.cfg.train_for_seconds
         return end
 
     def _after_training_iteration(self, training_iteration_since_resume: int):
         self._observers_call(AlgoObserver.on_training_step, self, training_iteration_since_resume)
 
-        if self._should_end_training():
+        mc_complete = self.cfg.algo == "PPO" and (
+            self.cfg.ppo_start_round + training_iteration_since_resume > self.cfg.ppo["rounds"]
+        )
+        if mc_complete or self._should_end_training():
             self._stop_training()
 
     def _stop_training(self, failed: bool = False) -> None:
@@ -745,6 +769,20 @@ class Runner(EventLoopObject, Configurable):
         assert self.event_loop.owner is self
         self.event_loop.stop()
 
+    def _force_shutdown_processes(self):
+        pass
+
+    def _drain_shutdown(self):
+        deadline = time.time() + SHUTDOWN_DRAIN_TIMEOUT_SEC
+        while self.components_to_stop and time.time() < deadline:
+            self.event_loop.process_events()
+            time.sleep(0.01)
+
+        if self.components_to_stop:
+            remaining = [component.object_id for component in self.components_to_stop]
+            log.error("Forcing shutdown with components still running: %r", remaining)
+            self._force_shutdown_processes()
+
     # noinspection PyBroadException
     def run(self) -> StatusCode:
         with self.timing.timeit("main_loop"):
@@ -753,10 +791,15 @@ class Runner(EventLoopObject, Configurable):
                 self.status = (
                     ExperimentStatus.INTERRUPTED if evt_loop_status == EventLoopStatus.INTERRUPTED else self.status
                 )
-                self.stop.emit(self.object_id)
             except Exception:
                 log.exception(f"Uncaught exception in {self.object_id} evt loop")
                 self.status = ExperimentStatus.FAILURE
+
+            if self.status == ExperimentStatus.FAILURE:
+                self._stop_training(failed=True)
+            elif self.status == ExperimentStatus.INTERRUPTED:
+                self._stop_training()
+            self._drain_shutdown()
 
         log.info(self.timing)
         if self.total_env_steps_since_resume is None:

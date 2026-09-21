@@ -10,11 +10,13 @@ from signal_slot.signal_slot import EventLoop, Timer, signal
 from torch import Tensor
 
 from sample_factory.algo.learning.batcher import Batcher
+from sample_factory.algo.fast_td3.learner import FastTD3Learner
+from sample_factory.algo.mc_ppo.learner import MCPPOLearner
 from sample_factory.algo.learning.learner import Learner
 from sample_factory.algo.utils.context import SampleFactoryContext, set_global_context
 from sample_factory.algo.utils.env_info import EnvInfo
 from sample_factory.algo.utils.heartbeat import HeartbeatStoppableEventLoopObject
-from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, POLICY_ID_KEY
+from sample_factory.algo.utils.misc import LEARNER_ENV_STEPS, LEARNER_TRAIN_STEPS, POLICY_ID_KEY
 from sample_factory.algo.utils.model_sharing import ParameterServer
 from sample_factory.algo.utils.shared_buffers import BufferMgr
 from sample_factory.algo.utils.torch_utils import init_torch_runtime
@@ -67,7 +69,8 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         policy_versions_tensor: Tensor = buffer_mgr.policy_versions
         self.param_server = ParameterServer(policy_id, policy_versions_tensor, cfg.serial_mode)
-        self.learner: Learner = Learner(cfg, env_info, policy_versions_tensor, policy_id, self.param_server)
+        learner_cls = {"FAST_TD3": FastTD3Learner, "PPO": MCPPOLearner, "APPO": Learner}[cfg.algo]
+        self.learner = learner_cls(cfg, env_info, policy_versions_tensor, policy_id, self.param_server)
 
         # total number of full training iterations (potentially multiple minibatches/epochs per iteration)
         self.training_iteration_since_resume: int = 0
@@ -134,7 +137,11 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
         self.model_initialized.emit(init_model_data)
 
         # runner should know the number of env steps in case we resume from a checkpoint
-        self.report_msg.emit({LEARNER_ENV_STEPS: self.learner.env_steps, POLICY_ID_KEY: self.learner.policy_id})
+        self.report_msg.emit({
+            LEARNER_ENV_STEPS: self.learner.env_steps,
+            LEARNER_TRAIN_STEPS: self.learner.train_step,
+            POLICY_ID_KEY: self.learner.policy_id,
+        })
 
         self.initialized.emit()
         log.debug(f"{self.object_id} finished initialization!")
@@ -144,9 +151,9 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
         self.training_iteration_since_resume += 1
         self.training_batch_released.emit(batch_idx, self.training_iteration_since_resume)
-        self.finished_training_iteration.emit(self.training_iteration_since_resume)
         if stats is not None:
             self.report_msg.emit(stats)
+        self.finished_training_iteration.emit(self.training_iteration_since_resume)
 
     # noinspection PyMethodMayBeStatic
     def _cleanup_cache(self):
@@ -154,6 +161,8 @@ class LearnerWorker(HeartbeatStoppableEventLoopObject, Configurable):
 
     def on_stop(self, *args):
         self.learner.save()
+        if self.cfg.algo == "PPO":
+            self.learner.close()
         if not self.cfg.serial_mode:
             self.join_batcher_thread()
 

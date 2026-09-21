@@ -114,6 +114,7 @@ class NonBatchedMultiAgentWrapper(Wrapper):
         action = action[0]
         obs, rew, terminated, truncated, info = self.env.step(action)
         if terminated or truncated:  # auto-resetting
+            info["final_observation"] = obs
             obs, info["reset_info"] = self.env.reset()
         return [obs], [rew], [terminated], [truncated], [info]
 
@@ -127,6 +128,9 @@ class NonBatchedDictObservationsWrapper(_DictObservationsWrapper):
 
     def step(self, action: ListActions) -> Tuple[ListOfDictObservations, Any, Any, Any, Any]:
         obs, rew, terminated, truncated, info = self.env.step(action)
+        for item in info:
+            if "final_observation" in item:
+                item["final_observation"] = dict(obs=item["final_observation"])
         return [dict(obs=o) for o in obs], rew, terminated, truncated, info
 
 

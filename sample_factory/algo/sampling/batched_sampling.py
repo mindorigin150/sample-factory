@@ -9,10 +9,15 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from sample_factory.algo.sampling.sampling_utils import VectorEnvRunner, record_episode_statistics_wrapper_stats
+from sample_factory.algo.sampling.sampling_utils import (
+    VectorEnvRunner,
+    _clip_actions_to_space,
+    record_episode_statistics_wrapper_stats,
+)
 from sample_factory.algo.utils.env_info import EnvInfo, check_env_info
 from sample_factory.algo.utils.make_env import BatchedVecEnv, SequentialVectorizeWrapper, make_env_func_batched
 from sample_factory.algo.utils.misc import EPISODIC, POLICY_ID_KEY
+from sample_factory.algo.utils.cuda_event_handoff import record_cuda_event, wait_cuda_event
 from sample_factory.algo.utils.tensor_dict import TensorDict
 from sample_factory.algo.utils.torch_utils import synchronize
 from sample_factory.envs.env_utils import (
@@ -38,6 +43,8 @@ def preprocess_actions(
     A potential way to reduce this complexity: demand all environments to have a Tuple action space even if they
     only have a single Discrete or Box action space.
     """
+
+    actions = _clip_actions_to_space(env_info.action_space, actions)
 
     if env_info.all_discrete or isinstance(env_info.action_space, gym.spaces.Discrete):
         return process_action_space(actions, env_info.gpu_actions, is_discrete=True, to_numpy=to_numpy)
@@ -150,6 +157,8 @@ class BatchedVectorEnvRunner(VectorEnvRunner):
         self.min_raw_rewards = self.max_raw_rewards = None
 
         self.device: Optional[torch.device] = None
+        self._policy_request_event: Optional[torch.cuda.Event] = None
+        self._policy_outputs_wait_event: Optional[torch.cuda.Event] = None
 
     def init(self, timing):
         """
@@ -390,6 +399,16 @@ class BatchedVectorEnvRunner(VectorEnvRunner):
     def synchronize_devices(self) -> None:
         """Make sure all writes to shared device buffers are finished."""
         synchronize(self.cfg, self.device)
+
+    def cuda_event_handoff_enabled(self) -> bool:
+        return not self.cfg.serial_mode and self.device is not None and self.device.type == "cuda"
+
+    def record_policy_request_event(self):
+        self._policy_request_event, handle = record_cuda_event(self.device, self._policy_request_event)
+        return handle
+
+    def wait_policy_outputs_event(self, handle) -> None:
+        self._policy_outputs_wait_event = wait_cuda_event(self.device, handle)
 
     def close(self):
         self.vec_env.close()

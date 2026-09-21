@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import gymnasium as gym
 import numpy as np
 
-from sample_factory.algo.sampling.sampling_utils import VectorEnvRunner, record_episode_statistics_wrapper_stats
+from sample_factory.algo.sampling.sampling_utils import (
+    VectorEnvRunner,
+    _clip_actions_to_space,
+    record_episode_statistics_wrapper_stats,
+)
 from sample_factory.algo.utils.agent_policy_mapping import AgentPolicyMapping
 from sample_factory.algo.utils.env_info import EnvInfo, check_env_info
 from sample_factory.algo.utils.make_env import make_env_func_non_batched
@@ -141,6 +145,7 @@ class ActorState:
         :return: the latest set of actions for this actor, calculated by the policy worker for the last observation
         """
         actions = ensure_numpy_array(self.last_actions)
+        actions = _clip_actions_to_space(self.env_info.action_space, actions)
 
         if self.env_info.all_discrete or isinstance(self.env_info.action_space, gym.spaces.Discrete):
             return self._process_action_space(actions, is_discrete=True)
@@ -190,7 +195,7 @@ class ActorState:
 
         self.curr_traj_buffer["rewards"][rollout_step] = float(reward)
         self.curr_traj_buffer["dones"][rollout_step] = done
-        self.curr_traj_buffer["time_outs"][rollout_step] = truncated
+        self.curr_traj_buffer["time_outs"][rollout_step] = truncated and (self.cfg.algo != "FAST_TD3" or not terminated)
 
         # -1 policy_id does not match any valid policy on the learner, therefore this will be treated as
         # invalid data coming from a different policy and should be ignored by the learner.
@@ -482,7 +487,11 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
                         )
                     policy_outputs_dict = dict()
                     for tensor_idx, name in enumerate(actor_state.policy_output_names):
-                        policy_outputs_dict[name] = policy_outputs[tensor_idx]
+                        policy_output = policy_outputs[tensor_idx]
+                        if name != "new_rnn_states":
+                            destination = actor_state.curr_traj_buffer[name][self.rollout_step]
+                            policy_output = policy_output.reshape(destination.shape)
+                        policy_outputs_dict[name] = policy_output
 
                     # save parsed trajectory outputs directly into the trajectory buffer
                     actor_state.set_trajectory_data(policy_outputs_dict, self.rollout_step)
@@ -529,6 +538,12 @@ class NonBatchedVectorEnvRunner(VectorEnvRunner):
 
         for agent_i in range(self.num_agents):
             actor_state = env_actor_states[agent_i]
+
+            if self.cfg.algo == "FAST_TD3":
+                actor_state.curr_traj_buffer["env_ids"][self.rollout_step] = actor_state.global_env_idx
+                done = terminated[agent_i] or truncated[agent_i]
+                next_obs = infos[agent_i]["final_observation"] if done else new_obs[agent_i]
+                actor_state.curr_traj_buffer["next_obs"][self.rollout_step] = next_obs
 
             episode_report = actor_state.record_env_step(
                 rewards[agent_i],

@@ -54,7 +54,7 @@ setup(
         "Videos": "https://sites.google.com/view/sample-factory",
     },
     install_requires=[
-        "numpy>=1.18.1,<2.0",
+        "numpy>=1.18.1,<3.0",
         "torch>=1.9,<3.0,!=1.13.0",
         "gymnasium>=0.27,<1.0",
         "pyglet",  # gym dependency
@@ -66,10 +66,10 @@ setup(
         # "faster-fifo>=1.4.2,<2.0",  <-- installed by signal-slot-mp
         "signal-slot-mp>=1.0.3,<2.0",
         "filelock",
+        "opencv-python-headless",
         "wandb>=0.12.9",
         "huggingface-hub>=0.10.0,<1.0",
         "pandas",
-        "opencv-python",
     ],
     extras_require={
         # some tests require Atari and Mujoco so let's make sure dev environment has that

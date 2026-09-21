@@ -133,6 +133,14 @@ def verify_cfg(cfg: Config, env_info: EnvInfo) -> bool:
         # batch.
         cfg_error("Normalized returns are not supported with vtrace!")
 
+    if cfg.algo == "FAST_TD3":
+        if cfg.batched_sampling:
+            cfg_error("FAST_TD3 does not support batched sampling")
+        if cfg.async_rl:
+            cfg_error("FAST_TD3 does not support async RL")
+        if cfg.use_rnn:
+            cfg_error("FAST_TD3 does not support RNNs")
+
     if cfg.async_rl and cfg.serial_mode:
         log.warning(
             "In serial mode all components run on the same process. Only use async_rl "
@@ -148,7 +156,7 @@ def verify_cfg(cfg: Config, env_info: EnvInfo) -> bool:
     samples_per_training_iteration = cfg.num_batches_per_epoch * cfg.batch_size
     samples_from_all_workers_per_rollout = total_num_agents(cfg, env_info) * cfg.rollout // cfg.num_policies
 
-    if sync_rl:
+    if sync_rl and cfg.algo != "PPO":
         if (
             samples_per_training_iteration % samples_from_all_workers_per_rollout == 0
             and samples_per_training_iteration >= samples_from_all_workers_per_rollout

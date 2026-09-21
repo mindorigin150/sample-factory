@@ -64,7 +64,7 @@ def action_info(env_info: EnvInfo) -> Tuple[int, int]:
     return num_actions, num_action_distribution_parameters
 
 
-def policy_output_shapes(num_actions, num_action_distribution_parameters) -> List[Tuple[str, List]]:
+def policy_output_shapes(num_actions, num_action_distribution_parameters, algo) -> List[Tuple[str, List]]:
     # policy outputs, this matches the expected output of the actor-critic
     policy_outputs = [
         ("actions", [num_actions]),
@@ -73,10 +73,12 @@ def policy_output_shapes(num_actions, num_action_distribution_parameters) -> Lis
         ("values", []),
         ("policy_version", []),
     ]
+    if algo == "PPO":
+        policy_outputs.append(("latent_actions", [num_actions]))
     return policy_outputs
 
 
-def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, device, share) -> TensorDict:
+def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, device, share, algo: str) -> TensorDict:
     obs_space = env_info.obs_space
 
     tensors = TensorDict()
@@ -89,10 +91,14 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
     # we need to allocate an extra rollout step here to calculate the value estimates for the last step
     for space_name, space in obs_space.spaces.items():
         tensors["obs"][space_name] = init_tensor([num_traj, rollout + 1], space.dtype, space.shape, device, share)
+    if algo == "FAST_TD3":
+        tensors["next_obs"] = TensorDict()
+        for space_name, space in obs_space.spaces.items():
+            tensors["next_obs"][space_name] = init_tensor([num_traj, rollout], space.dtype, space.shape, device, share)
     tensors["rnn_states"] = init_tensor([num_traj, rollout + 1], torch.float32, [rnn_size], device, share)
 
     num_actions, num_action_distribution_parameters = action_info(env_info)
-    policy_outputs = policy_output_shapes(num_actions, num_action_distribution_parameters)
+    policy_outputs = policy_output_shapes(num_actions, num_action_distribution_parameters, algo)
 
     # we need one more step to hold values for the last step
     outputs_with_extra_rollout_step = ["values"]
@@ -109,6 +115,11 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
     tensors["dones"].fill_(True)
     tensors["time_outs"] = init_tensor([num_traj, rollout], torch.bool, [], device, share)
     tensors["time_outs"].fill_(False)  # no timeouts by default
+    if algo == "FAST_TD3":
+        tensors["env_ids"] = init_tensor([num_traj, rollout], torch.int64, [], device, share)
+    if algo == "PPO":
+        tensors["raw_frames"] = init_tensor([num_traj, rollout], torch.int64, [], device, share)
+        tensors["raw_rewards"] = init_tensor([num_traj, rollout], torch.float64, [], device, share)
     tensors["policy_id"] = init_tensor([num_traj, rollout], torch.int, [], device, share)
     tensors["policy_id"].fill_(-1)  # -1 is an invalid policy index, experience from policy "-1" is always ignored
     tensors["valids"] = init_tensor([num_traj, rollout + 1], torch.bool, [], device, share)
@@ -128,7 +139,7 @@ def alloc_policy_output_tensors(cfg, env_info: EnvInfo, rnn_size, device, share)
         policy_outputs_shape += [envs_per_split, num_agents]
 
     num_actions, num_action_distribution_parameters = action_info(env_info)
-    policy_outputs = policy_output_shapes(num_actions, num_action_distribution_parameters)
+    policy_outputs = policy_output_shapes(num_actions, num_action_distribution_parameters, cfg.algo)
     policy_outputs += [("new_rnn_states", [rnn_size])]  # different name so we don't override current step rnn_state
 
     output_names, output_shapes = list(zip(*policy_outputs))
@@ -219,6 +230,7 @@ class BufferMgr(Configurable):
                 rnn_size,
                 device,
                 share,
+                cfg.algo,
             )
             self.policy_output_tensors_torch[device], output_names, output_sizes = alloc_policy_output_tensors(
                 cfg, env_info, rnn_size, device, share
@@ -234,6 +246,6 @@ class BufferMgr(Configurable):
                 for i in range(num_buffers):
                     self.traj_buffer_queues[device].put(i)
 
-        self.policy_versions = torch.zeros([cfg.num_policies], dtype=torch.int32)
+        self.policy_versions = torch.zeros([cfg.num_policies], dtype=torch.int64)
         if share:
             self.policy_versions.share_memory_()
