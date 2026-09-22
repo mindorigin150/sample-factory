@@ -86,10 +86,10 @@ class KlAdaptiveSchedulerPerEpoch(KlAdaptiveScheduler):
 
 
 class LinearDecayScheduler(LearningRateScheduler):
-    def __init__(self, cfg):
+    def __init__(self, cfg, initial_step: int):
         num_updates = cfg.train_for_env_steps // cfg.batch_size * cfg.num_epochs
         self.linear_decay = LinearDecay([(0, cfg.learning_rate), (num_updates, 0)])
-        self.step = 0
+        self.step = initial_step
 
     def invoke_after_each_minibatch(self):
         return True
@@ -100,7 +100,7 @@ class LinearDecayScheduler(LearningRateScheduler):
         return lr
 
 
-def get_lr_scheduler(cfg) -> LearningRateScheduler:
+def get_lr_scheduler(cfg, initial_step: int) -> LearningRateScheduler:
     if cfg.lr_schedule == "constant":
         return LearningRateScheduler()
     elif cfg.lr_schedule == "kl_adaptive_minibatch":
@@ -108,7 +108,7 @@ def get_lr_scheduler(cfg) -> LearningRateScheduler:
     elif cfg.lr_schedule == "kl_adaptive_epoch":
         return KlAdaptiveSchedulerPerEpoch(cfg)
     elif cfg.lr_schedule == "linear_decay":
-        return LinearDecayScheduler(cfg)
+        return LinearDecayScheduler(cfg, initial_step)
     else:
         raise RuntimeError(f"Unknown scheduler {cfg.lr_schedule}")
 
@@ -246,7 +246,7 @@ class Learner(Configurable):
         self.param_server.init(self.actor_critic, self.train_step, self.device)
         self.policy_versions_tensor[self.policy_id] = self.train_step
 
-        self.lr_scheduler = get_lr_scheduler(self.cfg)
+        self.lr_scheduler = get_lr_scheduler(self.cfg, self.train_step)
         self.curr_lr = self.cfg.learning_rate if self.curr_lr is None else self.curr_lr
         self._apply_lr(self.curr_lr)
 
