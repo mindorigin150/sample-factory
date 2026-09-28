@@ -86,17 +86,18 @@ class KlAdaptiveSchedulerPerEpoch(KlAdaptiveScheduler):
 
 
 class LinearDecayScheduler(LearningRateScheduler):
-    def __init__(self, cfg, initial_step: int):
+    def __init__(self, cfg, initial_step: int, min_lr: float):
         num_updates = cfg.train_for_env_steps // cfg.batch_size * cfg.num_epochs
         self.linear_decay = LinearDecay([(0, cfg.learning_rate), (num_updates, 0)])
         self.step = initial_step
+        self.min_lr = min_lr
 
     def invoke_after_each_minibatch(self):
         return True
 
     def update(self, current_lr, recent_kls):
         self.step += 1
-        lr = self.linear_decay.at(self.step)
+        lr = max(self.linear_decay.at(self.step), self.min_lr)
         return lr
 
 
@@ -108,7 +109,9 @@ def get_lr_scheduler(cfg, initial_step: int) -> LearningRateScheduler:
     elif cfg.lr_schedule == "kl_adaptive_epoch":
         return KlAdaptiveSchedulerPerEpoch(cfg)
     elif cfg.lr_schedule == "linear_decay":
-        return LinearDecayScheduler(cfg, initial_step)
+        return LinearDecayScheduler(cfg, initial_step, 0.0)
+    elif cfg.lr_schedule == "linear_decay_floor":
+        return LinearDecayScheduler(cfg, initial_step, cfg.lr_schedule_min_lr)
     else:
         raise RuntimeError(f"Unknown scheduler {cfg.lr_schedule}")
 
@@ -550,6 +553,10 @@ class Learner(Configurable):
             clip_value = self.cfg.ppo_clip_value
 
             valids = mb.valids
+            actor_valids = (
+                valids & mb.command_admitted if getattr(self.cfg, "mask_unadmitted_actor", False) else valids
+            )
+            num_actor_invalids = actor_valids.numel() - actor_valids.sum().item()
 
         # calculate policy head outside of recurrent loop
         with self.timing.add_time("forward_head"):
@@ -646,18 +653,33 @@ class Learner(Configurable):
                 adv = mb.advantages
                 targets = mb.returns
 
-            adv_std, adv_mean = torch.std_mean(masked_select(adv, valids, num_invalids))
+            if num_actor_invalids == actor_valids.numel():
+                adv_std, adv_mean = adv.new_zeros(()), adv.new_zeros(())
+            elif getattr(self.cfg, "mask_unadmitted_actor", False) and num_actor_invalids == actor_valids.numel() - 1:
+                # A singleton cannot estimate variance; preserve its uncentered actor advantage.
+                adv_std, adv_mean = adv.new_ones(()), adv.new_zeros(())
+            else:
+                adv_std, adv_mean = torch.std_mean(masked_select(adv, actor_valids, num_actor_invalids))
             adv_min = adv.min()
             adv_max = adv.max()
             adv = (adv - adv_mean) / torch.clamp_min(adv_std, 1e-7)  # normalize advantage
 
         with self.timing.add_time("losses"):
             # noinspection PyTypeChecker
-            policy_loss = self._policy_loss(ratio, adv, clip_ratio_low, clip_ratio_high, valids, num_invalids)
-            exploration_loss = self.exploration_loss_func(action_distribution, valids, num_invalids)
-            kl_old, kl_loss = self.kl_loss_func(
-                self.actor_critic.action_space, mb.action_logits, action_distribution, valids, num_invalids
-            )
+            if num_actor_invalids == actor_valids.numel():
+                policy_loss, exploration_loss, kl_old, kl_loss = ratio.sum() * 0, 0.0, ratio.detach().new_zeros(1), 0.0
+            else:
+                policy_loss = self._policy_loss(
+                    ratio, adv, clip_ratio_low, clip_ratio_high, actor_valids, num_actor_invalids
+                )
+                exploration_loss = self.exploration_loss_func(action_distribution, actor_valids, num_actor_invalids)
+                kl_old, kl_loss = self.kl_loss_func(
+                    self.actor_critic.action_space,
+                    mb.action_logits,
+                    action_distribution,
+                    actor_valids,
+                    num_actor_invalids,
+                )
             old_values = mb["values"]
             value_loss = self._value_loss(values, old_values, targets, clip_value, valids, num_invalids)
 
@@ -771,7 +793,17 @@ class Learner(Configurable):
                             mb.action_logits,
                         )
                         kl_old = action_distribution.kl_divergence(old_action_distribution)
-                        kl_old = masked_select(kl_old, mb.valids, num_invalids)
+                        actor_valids = (
+                            mb.valids & mb.command_admitted
+                            if getattr(self.cfg, "mask_unadmitted_actor", False)
+                            else mb.valids
+                        )
+                        if not actor_valids.any():
+                            kl_old = kl_old.new_zeros(1)
+                        else:
+                            kl_old = masked_select(
+                                kl_old, actor_valids, actor_valids.numel() - actor_valids.sum().item()
+                            )
 
                     kl_old_mean = float(kl_old.mean().item())
                     recent_kls.append(kl_old_mean)

@@ -201,6 +201,8 @@ class ActorState:
         # invalid data coming from a different policy and should be ignored by the learner.
         policy_id = -1 if not self.is_active else self.curr_policy_id
         self.curr_traj_buffer["policy_id"][rollout_step] = policy_id
+        if getattr(self.cfg, "mask_unadmitted_actor", False):
+            self.curr_traj_buffer["command_admitted"][rollout_step] = info["command_admitted"]
 
         # multiply by frameskip to get the episode lenghts matching the actual number of simulated steps
         self.last_episode_duration += self.env_info.frameskip if self.cfg.summaries_use_frameskip else 1

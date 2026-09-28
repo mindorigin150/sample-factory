@@ -308,10 +308,11 @@ def add_rl_args(p: ArgumentParser):
     p.add_argument(
         "--lr_schedule",
         default="constant",
-        choices=["constant", "kl_adaptive_minibatch", "kl_adaptive_epoch"],
+        choices=["constant", "kl_adaptive_minibatch", "kl_adaptive_epoch", "linear_decay", "linear_decay_floor"],
         type=str,
         help=(
             "Learning rate schedule to use. Constant keeps constant learning rate throughout training."
+            "linear_decay_floor uses the task's --lr_schedule_min_lr. "
             "kl_adaptive* schedulers look at --lr_schedule_kl_threshold and if KL-divergence with behavior policy"
             "after the last minibatch/epoch significantly deviates from this threshold, lr is apropriately"
             "increased or decreased"

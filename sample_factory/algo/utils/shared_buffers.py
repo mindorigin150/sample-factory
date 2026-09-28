@@ -78,7 +78,9 @@ def policy_output_shapes(num_actions, num_action_distribution_parameters, algo) 
     return policy_outputs
 
 
-def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, device, share, algo: str) -> TensorDict:
+def alloc_trajectory_tensors(
+    env_info: EnvInfo, num_traj, rollout, rnn_size, device, share, algo: str, mask_unadmitted_actor: bool = False
+) -> TensorDict:
     obs_space = env_info.obs_space
 
     tensors = TensorDict()
@@ -113,6 +115,8 @@ def alloc_trajectory_tensors(env_info: EnvInfo, num_traj, rollout, rnn_size, dev
     tensors["rewards"].fill_(-42.42)  # if we're using uninitialized values by mistake it will be obvious
     tensors["dones"] = init_tensor([num_traj, rollout], torch.bool, [], device, share)
     tensors["dones"].fill_(True)
+    if mask_unadmitted_actor:
+        tensors["command_admitted"] = init_tensor([num_traj, rollout], torch.bool, [], device, share)
     tensors["time_outs"] = init_tensor([num_traj, rollout], torch.bool, [], device, share)
     tensors["time_outs"].fill_(False)  # no timeouts by default
     if algo == "FAST_TD3":
@@ -231,6 +235,7 @@ class BufferMgr(Configurable):
                 device,
                 share,
                 cfg.algo,
+                getattr(cfg, "mask_unadmitted_actor", False),
             )
             self.policy_output_tensors_torch[device], output_names, output_sizes = alloc_policy_output_tensors(
                 cfg, env_info, rnn_size, device, share

@@ -337,6 +337,10 @@ class BatchedVectorEnvRunner(VectorEnvRunner):
                 time_outs=truncated,  # true only when done is also true, used for value bootstrapping
                 policy_id=self.policy_id_buffer,
             )
+            if getattr(self.cfg, "mask_unadmitted_actor", False):
+                self.curr_step["command_admitted"][:] = torch.as_tensor(
+                    [info["command_admitted"] for info in infos], dtype=torch.bool, device=self.device
+                )
 
             # reset next-step hidden states to zero if we encountered an episode boundary
             # not sure if this is the best practice, but this is what everybody seems to be doing
